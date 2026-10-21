@@ -1326,18 +1326,18 @@ function PostModal({ tender, settings, onClose, onCopy }: {
 function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: {
   tender: Tender; settings: AppSettings; onClose: () => void; onCopyBanner: () => void; onMarkCopied: () => void;
 }) {
-  // ROOT CAUSE FIX: The previous implementation had a deadlock:
-  // - isLoading=true showed spinner, hiding the <img> element
-  // - <img> onLoad set isLoading=false, but <img> was never rendered
-  // - Result: spinner forever
-  // 
-  // FIX: Set isLoading=false immediately after blob is created.
-  // The <img> loads asynchronously for display verification only.
+  // Store the actual Blob in a ref to ensure we always have access to the data
+  // This prevents stale URL issues and allows creating fresh object URLs on demand
+  const blobRef = useRef<Blob | null>(null);
   const [bannerUrl, setBannerUrl] = useState<string | null>(null);
   const [bannerError, setBannerError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [dimensions, setDimensions] = useState<{ w: number; h: number } | null>(null);
+  const [downloadAttempted, setDownloadAttempted] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
+
+  // Detect if we're in an iframe (which may block downloads)
+  const isInIframe = typeof window !== 'undefined' && window !== window.top;
 
   useEffect(() => {
     let objectUrl: string | null = null;
@@ -1349,6 +1349,7 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
       setBannerError('');
       setBannerUrl(null);
       setDimensions(null);
+      setDownloadAttempted(false);
 
       // Timeout: if generation takes more than 10 seconds, show error
       timeoutId = setTimeout(() => {
@@ -1377,8 +1378,17 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
           console.warn(`Unexpected blob type: ${blob.type}, expected image/png`);
         }
 
+        // Store the blob in a ref for reliable access during download
+        blobRef.current = blob;
+
         objectUrl = URL.createObjectURL(blob);
         setBannerUrl(objectUrl);
+        
+        console.log('[Banner Modal] Blob generated:', {
+          size: blob.size,
+          type: blob.type,
+          url: objectUrl
+        });
         
         // CRITICAL FIX: Set isLoading=false HERE, not in img.onload
         // The blob is ready and valid. The <img> will render and load asynchronously.
@@ -1420,58 +1430,102 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
   };
 
   const handleDownload = () => {
-    if (!bannerUrl) {
-      setBannerError('No banner available to download. Please regenerate.');
+    // Use the blob from ref to ensure we have the actual data, not a potentially stale URL
+    const blob = blobRef.current;
+    
+    if (!blob) {
+      setBannerError('No banner data available. Please regenerate the banner.');
       return;
     }
     
-    console.log('[Banner Modal Download] Initiating download for URL:', bannerUrl);
+    console.log('[Banner Modal Download] Starting download with blob:', {
+      size: blob.size,
+      type: blob.type
+    });
     
     try {
+      // Create a FRESH object URL from the blob for this download attempt
+      // This ensures we're not using a stale or revoked URL
+      const freshUrl = URL.createObjectURL(blob);
+      
       // Sanitize tender ID for filename
       const safeId = (tender.tenderId || 'tender').replace(/[^a-zA-Z0-9_-]/g, '_');
-      const filename = `banner_${safeId}.png`;
+      const filename = `mp-tender-${safeId}.png`;
       
       const link = document.createElement('a');
-      link.href = bannerUrl;
+      link.href = freshUrl;
       link.download = filename;
       link.style.display = 'none';
-      link.setAttribute('data-testid', 'banner-download-link');
       document.body.appendChild(link);
       
-      // Trigger download
+      console.log('[Banner Modal Download] Clicking download link:', {
+        filename,
+        href: freshUrl,
+        hasDownloadAttr: link.hasAttribute('download')
+      });
+      
+      // Trigger download synchronously within user gesture
       link.click();
       
-      console.log('[Banner Modal Download] Download triggered for:', filename);
+      setDownloadAttempted(true);
       
-      // Clean up link element after delay (don't remove immediately)
+      // Clean up: revoke URL and remove link after browser has time to consume
+      // Don't revoke immediately - browser needs time to start the download
       setTimeout(() => {
+        URL.revokeObjectURL(freshUrl);
         if (document.body.contains(link)) {
           document.body.removeChild(link);
         }
-      }, 1000);
+        console.log('[Banner Modal Download] Cleaned up object URL and link element');
+      }, 10000); // 10 seconds is plenty for download to start
       
-      // Show success feedback
-      setBannerError(''); // Clear any previous errors
-      // Note: We can't show a notification from here, but the download should work
+      // Note: Browsers do NOT provide a reliable confirmation that the file was saved.
+      // The download may be blocked by browser settings, iframe sandbox restrictions,
+      // or user preferences. We cannot detect this from JavaScript.
+      
     } catch (e: any) {
       console.error('[Banner Modal Download] Error:', e);
-      setBannerError(`Download failed: ${e?.message || 'Unknown error'}. Try right-click → "Save image as..."`);
+      setBannerError(`Download failed: ${e?.message || 'Unknown error'}. Use "Open PNG" and press Ctrl+S to save.`);
     }
   };
   
   // Fallback: Open banner in new tab for manual save
+  // This is the most reliable method when download attribute is blocked
   const handleOpenInNewTab = () => {
-    if (!bannerUrl) {
-      setBannerError('No banner available.');
+    const blob = blobRef.current;
+    
+    if (!blob) {
+      setBannerError('No banner data available. Please regenerate.');
       return;
     }
+    
     try {
-      window.open(bannerUrl, '_blank');
-      console.log('[Banner Modal] Opened in new tab');
+      // Create a fresh object URL for the new tab
+      // This ensures we're not using a potentially stale URL
+      const freshUrl = URL.createObjectURL(blob);
+      
+      console.log('[Banner Modal] Opening in new tab with fresh URL:', freshUrl);
+      
+      const newWindow = window.open(freshUrl, '_blank');
+      
+      if (!newWindow) {
+        // Popup was blocked - try alternative approach
+        console.warn('[Banner Modal] Popup blocked, trying alternative');
+        setBannerError('Popup was blocked. Please allow popups for this site, or right-click the banner image above and select "Save image as..."');
+        URL.revokeObjectURL(freshUrl);
+        return;
+      }
+      
+      // Clean up the URL after a delay (new tab should have loaded by then)
+      setTimeout(() => {
+        URL.revokeObjectURL(freshUrl);
+        console.log('[Banner Modal] Revoked object URL after opening in new tab');
+      }, 60000); // 60 seconds is safe
+      
+      console.log('[Banner Modal] Opened in new tab successfully');
     } catch (e: any) {
       console.error('[Banner Modal] Failed to open in new tab:', e);
-      setBannerError(`Failed to open: ${e?.message || 'Unknown error'}`);
+      setBannerError(`Failed to open: ${e?.message || 'Unknown error'}. Try right-clicking the banner image and selecting "Save image as..."`);
     }
   };
 
@@ -1499,7 +1553,7 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
               Generating banner...
             </div>
           ) : bannerUrl ? (
-            <div className="flex flex-col items-center gap-2">
+            <div className="flex flex-col items-center gap-2 w-full">
               <img
                 ref={imgRef}
                 src={bannerUrl}
@@ -1507,10 +1561,29 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
                 onLoad={handleImageLoad}
                 onError={handleImageError}
                 className="max-w-full h-auto rounded-lg shadow-md border border-slate-200"
-                style={{ maxHeight: '55vh' }}
+                style={{ maxHeight: '50vh' }}
               />
               {bannerError && (
                 <div className="text-amber-600 text-xs text-center">{bannerError}</div>
+              )}
+              
+              {/* Download instruction panel - always visible when banner is ready */}
+              {downloadAttempted && isInIframe && (
+                <div className="w-full mt-3 p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-800">
+                  <p className="font-semibold mb-1">📥 Download Note:</p>
+                  <p>If the file didn't download automatically (common in embedded browsers), use one of these methods:</p>
+                  <ol className="list-decimal list-inside mt-1 space-y-0.5">
+                    <li>Click "Open PNG" → Right-click the image → "Save image as..."</li>
+                    <li>Click "Open PNG" → Press Ctrl+S (or Cmd+S on Mac)</li>
+                  </ol>
+                </div>
+              )}
+              
+              {!downloadAttempted && isInIframe && (
+                <div className="w-full mt-3 p-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">
+                  <p className="font-semibold">⚠️ Embedded Browser:</p>
+                  <p>Automatic downloads may not work here. If "Download PNG" doesn't work, click "Open PNG" and use Ctrl+S to save.</p>
+                </div>
               )}
             </div>
           ) : null}
@@ -1518,25 +1591,27 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
         <div className="p-4 border-t border-slate-200 flex flex-wrap gap-2 flex-shrink-0">
           <button
             onClick={onCopyBanner}
-            disabled={!bannerUrl}
+            disabled={!blobRef.current}
             className="flex-1 px-3 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Copy banner to clipboard"
           >
             <Copy className="w-3.5 h-3.5" /> Copy
           </button>
           <button
             onClick={handleDownload}
-            disabled={!bannerUrl}
+            disabled={!blobRef.current}
             className="flex-1 px-3 py-2 bg-navy-700 text-white rounded-lg text-sm font-medium hover:bg-navy-800 transition flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Download banner as PNG file"
           >
             <Download className="w-3.5 h-3.5" /> Download PNG
           </button>
           <button
             onClick={handleOpenInNewTab}
-            disabled={!bannerUrl}
-            className="flex-1 px-3 py-2 bg-slate-600 text-white rounded-lg text-sm font-medium hover:bg-slate-700 transition flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
-            title="Open banner in new tab for manual save"
+            disabled={!blobRef.current}
+            className="flex-1 px-3 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 transition flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Open banner in new tab - use Ctrl+S to save"
           >
-            <ExternalLink className="w-3.5 h-3.5" /> Open
+            <ExternalLink className="w-3.5 h-3.5" /> Open PNG
           </button>
           <button
             onClick={onMarkCopied}
