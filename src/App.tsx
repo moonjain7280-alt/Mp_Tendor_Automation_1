@@ -6,7 +6,7 @@ import { generateHindiPost } from './utils/postGenerator';
 import { generateBanner } from './utils/bannerGenerator';
 import { loadTenders, saveTenders, loadSettings, saveSettings, loadImportState, saveImportState } from './utils/storage';
 import { exportToCSV } from './utils/csvExport';
-import { fetchLiveTenders, parsePastedContent, parseCSVContent } from './utils/tenderImport';
+import { fetchLiveTenders, parsePastedContent, parseCSVContent, extractTendersHybrid, isAIConfigured, getAIConfig, saveAIConfig, ImportStats, AIProviderConfig } from './utils/tenderImport';
 import { v4 as uuidv4 } from 'uuid';
 import {
   Search, Plus, Download, Trash2, Edit3, Copy, Check, X, Eye,
@@ -824,15 +824,24 @@ function ImportView({ onImportComplete, onGoBack }: {
   const [isFetching, setIsFetching] = useState(false);
   const [fetchResult, setFetchResult] = useState<string>('');
   const [previewTenders, setPreviewTenders] = useState<Tender[]>([]);
+  const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
+  const [importStats, setImportStats] = useState<ImportStats | null>(null);
+  const [importWarning, setImportWarning] = useState<string>('');
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [showAIConfig, setShowAIConfig] = useState(false);
+  const [aiConfig, setAiConfig] = useState<AIProviderConfig>(getAIConfig() || { enabled: false, provider: 'openai', apiUrl: '', apiKey: '', model: '' });
 
   const handleAutoFetch = async () => {
     setIsFetching(true);
     setFetchResult('');
+    setImportWarning('');
     try {
       const result = await fetchLiveTenders();
       if (result.success) {
         setPreviewTenders(result.tenders);
-        const statsInfo = result.stats ? ` (Rows: ${result.stats.totalRows}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected})` : '';
+        setSelectedIndices(new Set(result.tenders.map((_, i) => i)));
+        if (result.stats) setImportStats(result.stats);
+        const statsInfo = result.stats ? ` (Candidates: ${result.stats.candidatesDetected}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected})` : '';
         setFetchResult(`✅ Found ${result.tenders.length} real tenders from the official portal.${statsInfo}`);
       } else {
         setFetchResult(`⚠️ ${result.message}`);
@@ -844,19 +853,50 @@ function ImportView({ onImportComplete, onGoBack }: {
     }
   };
 
-  const handleParsePaste = () => {
+  const handleParsePaste = async () => {
     if (!pasteContent.trim()) {
       setFetchResult('Please paste content from the official portal.');
       return;
     }
-    const result = parsePastedContent(pasteContent);
-    if (result.tenders.length > 0) {
-      setPreviewTenders(result.tenders);
-      const missing = result.stats?.missingFields || {};
-      const missingInfo = Object.entries(missing).map(([k, v]) => `${k}: ${v}`).join(', ');
-      setFetchResult(`✅ Parsed ${result.tenders.length} tenders from pasted content. ${result.stats ? `(Rows: ${result.stats.totalRows}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected})` : ''}${missingInfo ? ` Missing fields: ${missingInfo}` : ''}`);
-    } else {
-      setFetchResult('❌ Could not parse any tenders. Make sure you pasted content from mptenders.gov.in → "Tenders by Closing Date" page.');
+    setIsFetching(true);
+    setFetchResult('');
+    setImportWarning('');
+    
+    try {
+      // Use hybrid extraction (deterministic + AI fallback)
+      const result = await extractTendersHybrid(pasteContent);
+      
+      if (result.tenders.length > 0) {
+        setPreviewTenders(result.tenders);
+        setSelectedIndices(new Set(result.tenders.map((_, i) => i)));
+        setImportStats(result.stats);
+        
+        const stats = result.stats;
+        const missing = stats.missingFields || {};
+        const missingInfo = Object.entries(missing).map(([k, v]) => `${k}: ${v}`).join(', ');
+        
+        setFetchResult(`✅ Extracted ${result.tenders.length} tenders (${result.method}). Candidates detected: ${stats.candidatesDetected}, Parsed: ${stats.parsed}, Needs review: ${stats.needsReview}, Rejected: ${stats.rejected}.${missingInfo ? ` Missing fields: ${missingInfo}` : ''}`);
+        
+        if (result.warning) {
+          setImportWarning(result.warning);
+        }
+      } else {
+        setFetchResult('❌ Could not parse any tenders. Make sure you pasted content from mptenders.gov.in → "Tenders by Closing Date" page. Try the AI extraction mode if configured.');
+        setImportStats(result.stats);
+      }
+    } catch (e) {
+      // Fallback to deterministic only
+      const result = parsePastedContent(pasteContent);
+      if (result.tenders.length > 0) {
+        setPreviewTenders(result.tenders);
+        setSelectedIndices(new Set(result.tenders.map((_, i) => i)));
+        setImportStats(result.stats);
+        setFetchResult(`✅ Parsed ${result.tenders.length} tenders (deterministic fallback).`);
+      } else {
+        setFetchResult('❌ Could not parse any tenders. Make sure you pasted content from mptenders.gov.in.');
+      }
+    } finally {
+      setIsFetching(false);
     }
   };
 
@@ -868,16 +908,43 @@ function ImportView({ onImportComplete, onGoBack }: {
     const result = parseCSVContent(csvContent);
     if (result.tenders.length > 0) {
       setPreviewTenders(result.tenders);
-      setFetchResult(`✅ Parsed ${result.tenders.length} tenders from CSV. ${result.stats ? `(Rows: ${result.stats.totalRows}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected})` : ''}`);
+      setSelectedIndices(new Set(result.tenders.map((_, i) => i)));
+      setImportStats(result.stats);
+      setFetchResult(`✅ Parsed ${result.tenders.length} tenders from CSV. (Candidates: ${result.stats.candidatesDetected}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected})`);
     } else {
       setFetchResult('❌ Could not parse any tenders from CSV.');
     }
   };
 
   const handleConfirmImport = () => {
-    if (previewTenders.length > 0) {
-      onImportComplete(previewTenders, `Imported ${previewTenders.length} tenders from ${activeTab === 'auto' ? 'official portal' : activeTab === 'paste' ? 'pasted HTML' : 'CSV file'}.`);
+    const selectedTenders = previewTenders.filter((_, i) => selectedIndices.has(i));
+    if (selectedTenders.length > 0) {
+      const skipped = previewTenders.length - selectedTenders.length;
+      const msg = `Imported ${selectedTenders.length} tenders from ${activeTab === 'auto' ? 'official portal' : activeTab === 'paste' ? 'pasted content' : 'CSV file'}.${skipped > 0 ? ` ${skipped} skipped by user.` : ''}`;
+      onImportComplete(selectedTenders, msg);
     }
+  };
+
+  const toggleSelection = (index: number) => {
+    setSelectedIndices(prev => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+
+  const selectAll = () => setSelectedIndices(new Set(previewTenders.map((_, i) => i)));
+  const deselectAll = () => setSelectedIndices(new Set());
+
+  const updatePreviewTender = (index: number, field: keyof Tender, value: string) => {
+    setPreviewTenders(prev => prev.map((t, i) => i === index ? { ...t, [field]: value } : t));
+  };
+
+  const handleSaveAIConfig = () => {
+    saveAIConfig(aiConfig);
+    setShowAIConfig(false);
+    setFetchResult(prev => prev + (prev ? '\n' : '') + '✅ AI configuration saved.');
   };
 
   return (
@@ -998,43 +1065,175 @@ function ImportView({ onImportComplete, onGoBack }: {
           </div>
         )}
 
+        {/* Import Warning */}
+        {importWarning && (
+          <div className="mt-4 p-4 rounded-lg border bg-amber-50 border-amber-200">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0" />
+              <p className="text-sm text-amber-800">{importWarning}</p>
+            </div>
+          </div>
+        )}
+
+        {/* Stats Summary */}
+        {importStats && (
+          <div className="mt-4 p-4 rounded-lg border bg-slate-50 border-slate-200">
+            <h4 className="text-sm font-bold text-slate-700 mb-2">Import Statistics</h4>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+              <div className="bg-white rounded p-2 border">
+                <span className="text-slate-500">Candidates Detected</span>
+                <p className="text-lg font-bold text-navy-700">{importStats.candidatesDetected}</p>
+              </div>
+              <div className="bg-white rounded p-2 border">
+                <span className="text-slate-500">Successfully Parsed</span>
+                <p className="text-lg font-bold text-green-600">{importStats.parsed}</p>
+              </div>
+              <div className="bg-white rounded p-2 border">
+                <span className="text-slate-500">Needs Review</span>
+                <p className="text-lg font-bold text-amber-600">{importStats.needsReview}</p>
+              </div>
+              <div className="bg-white rounded p-2 border">
+                <span className="text-slate-500">Rejected</span>
+                <p className="text-lg font-bold text-red-600">{importStats.rejected}</p>
+              </div>
+            </div>
+            {importStats.aiUsed && (
+              <p className="text-xs text-blue-600 mt-2">🤖 AI extraction used ({importStats.aiProvider})</p>
+            )}
+            {!isAIConfigured() && (
+              <button onClick={() => setShowAIConfig(!showAIConfig)} className="text-xs text-blue-600 hover:underline mt-2">
+                ⚙️ Configure AI extraction for better results
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* AI Configuration Panel */}
+        {showAIConfig && (
+          <div className="mt-4 p-4 rounded-lg border bg-blue-50 border-blue-200">
+            <h4 className="text-sm font-bold text-blue-800 mb-3">🤖 AI Extraction Configuration</h4>
+            <p className="text-xs text-blue-700 mb-3">
+              Configure an AI model to assist with parsing irregularly formatted tender text. 
+              <strong> API keys are stored locally in your browser.</strong> For production use, route through a secure server-side API.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Provider</label>
+                <select value={aiConfig.provider} onChange={e => setAiConfig(c => ({ ...c, provider: e.target.value as AIProviderConfig['provider'] }))}
+                  className="w-full px-2 py-1.5 border border-slate-200 rounded text-xs">
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Anthropic</option>
+                  <option value="custom">Custom Endpoint</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Model</label>
+                <input type="text" value={aiConfig.model} onChange={e => setAiConfig(c => ({ ...c, model: e.target.value }))}
+                  placeholder="gpt-4o-mini" className="w-full px-2 py-1.5 border border-slate-200 rounded text-xs" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">API URL</label>
+                <input type="text" value={aiConfig.apiUrl} onChange={e => setAiConfig(c => ({ ...c, apiUrl: e.target.value }))}
+                  placeholder="https://api.openai.com/v1/chat/completions" className="w-full px-2 py-1.5 border border-slate-200 rounded text-xs" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">API Key</label>
+                <input type="password" value={aiConfig.apiKey} onChange={e => setAiConfig(c => ({ ...c, apiKey: e.target.value }))}
+                  placeholder="sk-..." className="w-full px-2 py-1.5 border border-slate-200 rounded text-xs" />
+              </div>
+            </div>
+            <div className="flex items-center gap-3 mt-3">
+              <label className="flex items-center gap-2 text-xs">
+                <input type="checkbox" checked={aiConfig.enabled} onChange={e => setAiConfig(c => ({ ...c, enabled: e.target.checked }))} />
+                Enable AI extraction
+              </label>
+              <button onClick={handleSaveAIConfig} className="px-3 py-1.5 bg-blue-600 text-white rounded text-xs font-medium hover:bg-blue-700">
+                Save Config
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Preview Table */}
         {previewTenders.length > 0 && (
           <div className="mt-6">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="font-bold text-navy-800">Preview: {previewTenders.length} tenders to import</h3>
+            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div>
+                <h3 className="font-bold text-navy-800">
+                  Preview: {selectedIndices.size} of {previewTenders.length} selected
+                </h3>
+                <div className="flex gap-2 mt-1">
+                  <button onClick={selectAll} className="text-xs text-blue-600 hover:underline">Select All</button>
+                  <button onClick={deselectAll} className="text-xs text-blue-600 hover:underline">Deselect All</button>
+                </div>
+              </div>
               <button
                 onClick={handleConfirmImport}
-                className="px-6 py-2.5 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 transition flex items-center gap-2"
+                disabled={selectedIndices.size === 0}
+                className="px-6 py-2.5 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 transition flex items-center gap-2 disabled:opacity-50"
               >
-                <Check className="w-4 h-4" /> Confirm Import ({previewTenders.length} tenders)
+                <Check className="w-4 h-4" /> Confirm Import ({selectedIndices.size} tenders)
               </button>
             </div>
             <div className="overflow-x-auto border border-slate-200 rounded-lg">
               <table className="w-full text-xs">
                 <thead className="bg-slate-100">
                   <tr>
-                    <th className="px-3 py-2 text-left">Tender ID</th>
-                    <th className="px-3 py-2 text-left">Work Name</th>
-                    <th className="px-3 py-2 text-left">District</th>
-                    <th className="px-3 py-2 text-left">Last Date</th>
+                    <th className="px-2 py-2 text-left w-8">
+                      <input type="checkbox" checked={selectedIndices.size === previewTenders.length} onChange={e => e.target.checked ? selectAll() : deselectAll()} />
+                    </th>
+                    <th className="px-2 py-2 text-left">Tender ID</th>
+                    <th className="px-2 py-2 text-left">Work Name</th>
+                    <th className="px-2 py-2 text-left">Department</th>
+                    <th className="px-2 py-2 text-left">District</th>
+                    <th className="px-2 py-2 text-left">Closing Date</th>
+                    <th className="px-2 py-2 text-left">Value</th>
+                    <th className="px-2 py-2 text-left w-12">Edit</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {previewTenders.slice(0, 20).map((t, i) => (
-                    <tr key={i} className="hover:bg-slate-50">
-                      <td className="px-3 py-2 font-mono text-navy-700">{t.tenderId}</td>
-                      <td className="px-3 py-2 max-w-[300px] truncate">{t.workName}</td>
-                      <td className="px-3 py-2">{t.district}</td>
-                      <td className="px-3 py-2">{t.lastDate}</td>
+                  {previewTenders.map((t, i) => (
+                    <tr key={i} className={`hover:bg-slate-50 ${!selectedIndices.has(i) ? 'opacity-50' : ''}`}>
+                      <td className="px-2 py-2">
+                        <input type="checkbox" checked={selectedIndices.has(i)} onChange={() => toggleSelection(i)} />
+                      </td>
+                      {editingIndex === i ? (
+                        <>
+                          <td className="px-2 py-1"><input type="text" value={t.tenderId} onChange={e => updatePreviewTender(i, 'tenderId', e.target.value)} className="w-full px-1 py-0.5 border rounded text-xs font-mono" /></td>
+                          <td className="px-2 py-1"><input type="text" value={t.workName} onChange={e => updatePreviewTender(i, 'workName', e.target.value)} className="w-full px-1 py-0.5 border rounded text-xs" /></td>
+                          <td className="px-2 py-1"><input type="text" value={t.department} onChange={e => updatePreviewTender(i, 'department', e.target.value)} className="w-full px-1 py-0.5 border rounded text-xs" /></td>
+                          <td className="px-2 py-1"><input type="text" value={t.district} onChange={e => updatePreviewTender(i, 'district', e.target.value)} className="w-full px-1 py-0.5 border rounded text-xs" /></td>
+                          <td className="px-2 py-1"><input type="text" value={t.lastDate} onChange={e => updatePreviewTender(i, 'lastDate', e.target.value)} className="w-full px-1 py-0.5 border rounded text-xs" /></td>
+                          <td className="px-2 py-1"><input type="text" value={t.tenderAmount} onChange={e => updatePreviewTender(i, 'tenderAmount', e.target.value)} className="w-full px-1 py-0.5 border rounded text-xs" /></td>
+                          <td className="px-2 py-1">
+                            <button onClick={() => setEditingIndex(null)} className="text-green-600 hover:text-green-800 text-xs font-medium">✓</button>
+                          </td>
+                        </>
+                      ) : (
+                        <>
+                          <td className="px-2 py-2 font-mono text-navy-700 max-w-[120px] truncate" title={t.tenderId}>{t.tenderId}</td>
+                          <td className="px-2 py-2 max-w-[250px] truncate" title={t.workName}>{t.workName}</td>
+                          <td className="px-2 py-2 max-w-[150px] truncate" title={t.department}>{t.department}</td>
+                          <td className="px-2 py-2">{t.district}</td>
+                          <td className="px-2 py-2">{t.lastDate || '—'}</td>
+                          <td className="px-2 py-2">{t.tenderAmount || '—'}</td>
+                          <td className="px-2 py-2">
+                            <button onClick={() => setEditingIndex(i)} className="text-blue-600 hover:text-blue-800">
+                              <Edit3 className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </>
+                      )}
                     </tr>
                   ))}
                 </tbody>
               </table>
-              {previewTenders.length > 20 && (
-                <p className="text-xs text-slate-500 px-3 py-2">...and {previewTenders.length - 20} more</p>
-              )}
             </div>
+            {importStats && importStats.candidatesDetected > previewTenders.length && (
+              <p className="text-xs text-amber-600 mt-2 px-1">
+                ⚠️ {importStats.candidatesDetected - previewTenders.length} candidate(s) detected but could not be fully parsed.
+              </p>
+            )}
           </div>
         )}
       </div>
