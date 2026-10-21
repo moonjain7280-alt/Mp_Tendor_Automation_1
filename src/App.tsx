@@ -86,7 +86,8 @@ export default function App() {
           const newTenders = result.tenders.filter(t => !existingIds.has(t.tenderId));
           return [...newTenders, ...prev];
         });
-        showNotification(`✅ Successfully imported ${result.tenders.length} real tenders from official portal.`, 'success');
+        const statsInfo = result.stats ? ` (${result.stats.parsed} parsed, ${result.stats.rejected} rejected)` : '';
+        showNotification(`✅ Successfully imported ${result.tenders.length} real tenders${statsInfo}`, 'success');
       } else {
         showNotification(`⚠️ ${result.message}`, 'warning');
       }
@@ -179,13 +180,42 @@ export default function App() {
 
   const handleCopyPost = async (tender: Tender) => {
     const post = generateHindiPost(tender, settings);
+    
+    // Try modern clipboard API first
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(post);
+        setTenders(prev => prev.map(t => t.id === tender.id ? { ...t, textCopied: true, updatedAt: new Date().toISOString() } : t));
+        showNotification('✅ Post copied to clipboard successfully!', 'success');
+        return;
+      } catch (e) {
+        console.warn('Clipboard API failed, trying fallback:', e);
+      }
+    }
+    
+    // Fallback: use textarea-based copy
     try {
-      await navigator.clipboard.writeText(post);
-      setTenders(prev => prev.map(t => t.id === tender.id ? { ...t, textCopied: true, updatedAt: new Date().toISOString() } : t));
-      showNotification('✅ Post copied to clipboard successfully!', 'success');
-    } catch {
-      // Fallback: show manual copy option
-      showNotification('Clipboard access denied. Use "Preview & Copy" for manual copy.', 'error');
+      const textarea = document.createElement('textarea');
+      textarea.value = post;
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      textarea.style.top = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      
+      const success = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      
+      if (success) {
+        setTenders(prev => prev.map(t => t.id === tender.id ? { ...t, textCopied: true, updatedAt: new Date().toISOString() } : t));
+        showNotification('✅ Post copied to clipboard!', 'success');
+      } else {
+        showNotification('❌ Copy failed. Please use "Preview & Edit Post" to copy manually.', 'error');
+      }
+    } catch (e) {
+      console.error('Fallback copy failed:', e);
+      showNotification('❌ Copy failed. Please use "Preview & Edit Post" to copy manually.', 'error');
     }
   };
 
@@ -759,7 +789,8 @@ function ImportView({ onImportComplete, onGoBack }: {
       const result = await fetchLiveTenders();
       if (result.success) {
         setPreviewTenders(result.tenders);
-        setFetchResult(`✅ Found ${result.tenders.length} real tenders from the official portal.`);
+        const statsInfo = result.stats ? ` (Rows: ${result.stats.totalRows}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected})` : '';
+        setFetchResult(`✅ Found ${result.tenders.length} real tenders from the official portal.${statsInfo}`);
       } else {
         setFetchResult(`⚠️ ${result.message}`);
       }
@@ -775,10 +806,12 @@ function ImportView({ onImportComplete, onGoBack }: {
       setFetchResult('Please paste content from the official portal.');
       return;
     }
-    const tenders = parsePastedContent(pasteContent);
-    if (tenders.length > 0) {
-      setPreviewTenders(tenders);
-      setFetchResult(`✅ Parsed ${tenders.length} tenders from pasted content.`);
+    const result = parsePastedContent(pasteContent);
+    if (result.tenders.length > 0) {
+      setPreviewTenders(result.tenders);
+      const missing = result.stats?.missingFields || {};
+      const missingInfo = Object.entries(missing).map(([k, v]) => `${k}: ${v}`).join(', ');
+      setFetchResult(`✅ Parsed ${result.tenders.length} tenders from pasted content. ${result.stats ? `(Rows: ${result.stats.totalRows}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected})` : ''}${missingInfo ? ` Missing fields: ${missingInfo}` : ''}`);
     } else {
       setFetchResult('❌ Could not parse any tenders. Make sure you pasted content from mptenders.gov.in → "Tenders by Closing Date" page.');
     }
@@ -789,10 +822,10 @@ function ImportView({ onImportComplete, onGoBack }: {
       setFetchResult('Please paste CSV content.');
       return;
     }
-    const tenders = parseCSVContent(csvContent);
-    if (tenders.length > 0) {
-      setPreviewTenders(tenders);
-      setFetchResult(`✅ Parsed ${tenders.length} tenders from CSV.`);
+    const result = parseCSVContent(csvContent);
+    if (result.tenders.length > 0) {
+      setPreviewTenders(result.tenders);
+      setFetchResult(`✅ Parsed ${result.tenders.length} tenders from CSV. ${result.stats ? `(Rows: ${result.stats.totalRows}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected})` : ''}`);
     } else {
       setFetchResult('❌ Could not parse any tenders from CSV.');
     }
@@ -1169,20 +1202,42 @@ function PostModal({ tender, settings, onClose, onCopy }: {
 }) {
   const [editablePost, setEditablePost] = useState(generateHindiPost(tender, settings));
   const [copiedLocally, setCopiedLocally] = useState(false);
+  const [copyError, setCopyError] = useState('');
 
   const handleCopyEdited = async () => {
+    setCopyError('');
+    
+    // Try modern clipboard API first
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(editablePost);
+        setCopiedLocally(true);
+        onCopy(tender);
+        return;
+      } catch (e) {
+        console.warn('Clipboard API failed:', e);
+      }
+    }
+    
+    // Fallback: textarea-based copy
     try {
-      await navigator.clipboard.writeText(editablePost);
-      setCopiedLocally(true);
-      onCopy(tender);
-    } catch {
-      // Fallback: select text for manual copy
       const textarea = document.getElementById('post-text') as HTMLTextAreaElement;
       if (textarea) {
+        textarea.focus();
         textarea.select();
-        document.execCommand('copy');
-        setCopiedLocally(true);
+        textarea.setSelectionRange(0, editablePost.length);
+        
+        const success = document.execCommand('copy');
+        if (success) {
+          setCopiedLocally(true);
+          onCopy(tender);
+          return;
+        }
       }
+      setCopyError('Copy failed. Please select all text (Ctrl+A) and copy manually (Ctrl+C).');
+    } catch (e) {
+      console.error('Fallback copy failed:', e);
+      setCopyError('Copy failed. Please select all text (Ctrl+A) and copy manually (Ctrl+C).');
     }
   };
 
@@ -1201,16 +1256,23 @@ function PostModal({ tender, settings, onClose, onCopy }: {
             className="w-full h-full min-h-[300px] px-3 py-2 border border-slate-200 rounded-lg text-sm font-hindi leading-relaxed focus:outline-none focus:ring-2 focus:ring-navy-500 resize-none"
           />
         </div>
-        <div className="p-4 border-t border-slate-200 flex gap-3">
-          <button onClick={handleCopyEdited}
-            className={`flex-1 px-4 py-2.5 rounded-lg font-medium transition flex items-center justify-center gap-2 ${
-              copiedLocally ? 'bg-green-100 text-green-700 border border-green-300' : 'bg-green-600 text-white hover:bg-green-700'
-            }`}>
-            {copiedLocally ? <><Check className="w-4 h-4" /> COPIED ✓</> : <><Copy className="w-4 h-4" /> Copy Post</>}
-          </button>
-          <button onClick={onClose} className="px-4 py-2.5 bg-slate-100 text-slate-700 rounded-lg font-medium hover:bg-slate-200 transition">
-            Close
-          </button>
+        <div className="p-4 border-t border-slate-200">
+          {copyError && (
+            <div className="mb-3 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800">
+              {copyError}
+            </div>
+          )}
+          <div className="flex gap-3">
+            <button onClick={handleCopyEdited}
+              className={`flex-1 px-4 py-2.5 rounded-lg font-medium transition flex items-center justify-center gap-2 ${
+                copiedLocally ? 'bg-green-100 text-green-700 border border-green-300' : 'bg-green-600 text-white hover:bg-green-700'
+              }`}>
+              {copiedLocally ? <><Check className="w-4 h-4" /> COPIED ✓</> : <><Copy className="w-4 h-4" /> Copy Post</>}
+            </button>
+            <button onClick={onClose} className="px-4 py-2.5 bg-slate-100 text-slate-700 rounded-lg font-medium hover:bg-slate-200 transition">
+              Close
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -1223,35 +1285,52 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [bannerReady, setBannerReady] = useState(false);
+  const [bannerError, setBannerError] = useState('');
 
   useEffect(() => {
     const generate = async () => {
-      const blob = await generateBanner(tender, settings);
-      const url = URL.createObjectURL(blob);
-      const img = new window.Image();
-      img.onload = () => {
-        if (canvasRef.current) {
-          const ctx = canvasRef.current.getContext('2d')!;
-          canvasRef.current.width = img.width;
-          canvasRef.current.height = img.height;
-          ctx.drawImage(img, 0, 0);
-          setBannerReady(true);
-        }
-        URL.revokeObjectURL(url);
-      };
-      img.src = url;
+      try {
+        const blob = await generateBanner(tender, settings);
+        const url = URL.createObjectURL(blob);
+        const img = new window.Image();
+        img.onload = () => {
+          if (canvasRef.current) {
+            const ctx = canvasRef.current.getContext('2d')!;
+            canvasRef.current.width = img.width;
+            canvasRef.current.height = img.height;
+            ctx.drawImage(img, 0, 0);
+            setBannerReady(true);
+          }
+          URL.revokeObjectURL(url);
+        };
+        img.onerror = () => {
+          setBannerError('Failed to load banner image. Please try downloading instead.');
+          URL.revokeObjectURL(url);
+        };
+        img.src = url;
+      } catch (e) {
+        console.error('Banner generation failed:', e);
+        setBannerError('Failed to generate banner. Please try again.');
+      }
     };
     generate();
   }, [tender, settings]);
 
   const handleDownload = async () => {
-    const blob = await generateBanner(tender, settings);
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `banner_${tender.tenderId}.png`;
-    link.click();
-    URL.revokeObjectURL(url);
+    try {
+      const blob = await generateBanner(tender, settings);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `banner_${tender.tenderId}.png`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('Download failed:', e);
+      setBannerError('Download failed. Please try again.');
+    }
   };
 
   return (
@@ -1262,7 +1341,9 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
           <button onClick={onClose} className="p-1 hover:bg-slate-100 rounded"><X className="w-5 h-5" /></button>
         </div>
         <div className="p-4 overflow-y-auto flex justify-center">
-          {!bannerReady ? (
+          {bannerError ? (
+            <div className="text-red-600 text-sm py-8 text-center">{bannerError}</div>
+          ) : !bannerReady ? (
             <div className="text-slate-500 text-sm py-8">Generating banner...</div>
           ) : (
             <canvas ref={canvasRef} className="max-w-full h-auto rounded-lg shadow-md border border-slate-200" style={{ maxHeight: '50vh' }} />

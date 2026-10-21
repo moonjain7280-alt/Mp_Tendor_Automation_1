@@ -2,8 +2,11 @@ import { Tender, AppSettings } from '../types';
 
 /**
  * Generate a professional PNG banner (1080x1350) for a tender.
- * Uses Canvas API for programmatic generation - no external dependencies.
+ * Uses Canvas API for programmatic generation.
  * Only shows verified data from the tender record.
+ * 
+ * NOTE: Emojis may not render in all canvas environments.
+ * Using text labels instead for maximum compatibility.
  */
 export async function generateBanner(
   tender: Tender,
@@ -38,50 +41,57 @@ export async function generateBanner(
 
   // Header section
   ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 28px Inter, sans-serif';
+  ctx.font = 'bold 30px sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('🚨 मध्य प्रदेश टेंडर अपडेट 🚨', 540, 120);
+  ctx.fillText('MADHYA PRADESH TENDER UPDATE', 540, 115);
+
+  // Hindi subtitle
+  ctx.font = '22px sans-serif';
+  ctx.fillStyle = '#ffe066';
+  ctx.fillText('\u092E\u0927\u094D\u092F \u092A\u094D\u0930\u0926\u0947\u0936 \u091F\u0947\u0902\u0921\u0930 \u0905\u092A\u0921\u0947\u091F', 540, 148);
 
   // Gold divider
   ctx.fillStyle = '#d4a017';
-  ctx.fillRect(200, 140, 680, 3);
+  ctx.fillRect(200, 165, 680, 3);
 
   // Data source indicator
   let sourceColor = '#ffffff';
   let sourceLabel = '';
   if (tender.dataSource === 'sample') {
     sourceColor = '#ff6b6b';
-    sourceLabel = '⚠️ SAMPLE DATA';
+    sourceLabel = 'SAMPLE DATA';
   } else if (tender.dataSource === 'imported') {
     sourceColor = '#4ecdc4';
-    sourceLabel = '📥 IMPORTED FROM OFFICIAL PORTAL';
+    sourceLabel = 'IMPORTED FROM OFFICIAL PORTAL';
   } else {
     sourceColor = '#a8e6cf';
-    sourceLabel = '✅ MANUALLY ENTERED';
+    sourceLabel = 'MANUALLY ENTERED';
   }
   ctx.fillStyle = sourceColor;
-  ctx.font = 'bold 16px Inter, sans-serif';
-  ctx.fillText(sourceLabel, 540, 170);
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillText(sourceLabel, 540, 190);
 
   // Tender ID - highlighted
   ctx.fillStyle = '#ffe066';
-  ctx.font = 'bold 32px Inter, sans-serif';
-  ctx.fillText(`टेंडर ID: ${tender.tenderId || 'N/A'}`, 540, 220);
+  ctx.font = 'bold 28px sans-serif';
+  const tenderIdText = `Tender ID: ${tender.tenderId || 'N/A'}`;
+  ctx.fillText(tenderIdText, 540, 235);
 
   // District and Department
   ctx.fillStyle = '#bac8ff';
-  ctx.font = '22px Inter, sans-serif';
-  ctx.fillText(`📍 ${tender.district || 'N/A'} | 🏢 ${tender.department || 'N/A'}`, 540, 260);
+  ctx.font = '20px sans-serif';
+  const locationText = `${tender.district || 'N/A'} | ${tender.department || 'N/A'}`;
+  ctx.fillText(locationText, 540, 270);
 
   // Work name
   ctx.fillStyle = '#ffffff';
-  ctx.font = '22px Inter, sans-serif';
+  ctx.font = '20px sans-serif';
   const workName = tender.workName || 'Not Available';
   const wrappedWorkName = wrapText(ctx, workName, 900);
-  let y = 300;
+  let y = 310;
   for (const line of wrappedWorkName) {
     ctx.fillText(line, 540, y);
-    y += 32;
+    y += 30;
   }
 
   // Gold line
@@ -93,36 +103,36 @@ export async function generateBanner(
   const details: { label: string; value: string }[] = [];
   
   if (tender.tenderAmount) {
-    details.push({ label: '💰 अनुमानित लागत:', value: tender.tenderAmount });
+    details.push({ label: 'Estimated Cost:', value: tender.tenderAmount });
   }
   if (tender.emd) {
-    details.push({ label: '🔐 EMD:', value: tender.emd });
+    details.push({ label: 'EMD:', value: tender.emd });
   }
   if (tender.tenderFee) {
-    details.push({ label: '📄 टेंडर फीस:', value: tender.tenderFee });
+    details.push({ label: 'Tender Fee:', value: tender.tenderFee });
   }
   if (tender.lastDate) {
-    details.push({ label: '📅 अंतिम तिथि:', value: formatDateBanner(tender.lastDate) });
+    details.push({ label: 'Last Date:', value: formatDateBanner(tender.lastDate) });
   }
 
   ctx.textAlign = 'left';
   for (const detail of details) {
     ctx.fillStyle = '#d4a017';
-    ctx.font = 'bold 22px Inter, sans-serif';
+    ctx.font = 'bold 20px sans-serif';
     ctx.fillText(detail.label, 120, y);
     
     ctx.fillStyle = '#ffffff';
-    ctx.font = '22px Inter, sans-serif';
-    ctx.fillText(detail.value, 420, y);
-    y += 48;
+    ctx.font = '20px sans-serif';
+    ctx.fillText(detail.value, 380, y);
+    y += 45;
   }
 
   // If no details available, show notice
   if (details.length === 0) {
     ctx.fillStyle = '#bac8ff';
-    ctx.font = '20px Inter, sans-serif';
+    ctx.font = '18px sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('विवरण आधिकारिक स्रोत पर उपलब्ध नहीं', 540, y);
+    ctx.fillText('Details not available in source', 540, y);
     y += 40;
   }
 
@@ -130,31 +140,31 @@ export async function generateBanner(
   if (tender.lastDate) {
     y += 15;
     ctx.fillStyle = 'rgba(212, 160, 23, 0.15)';
-    ctx.fillRect(100, y, 880, 75);
+    ctx.fillRect(100, y, 880, 70);
     ctx.strokeStyle = '#d4a017';
     ctx.lineWidth = 2;
-    ctx.strokeRect(100, y, 880, 75);
+    ctx.strokeRect(100, y, 880, 70);
     
     ctx.textAlign = 'center';
     ctx.fillStyle = '#ffe066';
-    ctx.font = 'bold 26px Inter, sans-serif';
-    ctx.fillText(`⏰ अंतिम तिथि: ${formatDateBanner(tender.lastDate)}`, 540, y + 47);
-    y += 110;
+    ctx.font = 'bold 24px sans-serif';
+    ctx.fillText(`DEADLINE: ${formatDateBanner(tender.lastDate)}`, 540, y + 44);
+    y += 105;
   } else {
     y += 30;
   }
 
   // Official link note
   ctx.fillStyle = '#bac8ff';
-  ctx.font = '18px Inter, sans-serif';
+  ctx.font = '16px sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('🔗 आधिकारिक लिंक: mptenders.gov.in', 540, y);
+  ctx.fillText('Official Link: mptenders.gov.in', 540, y);
   y += 35;
 
   // Verification notice
   ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
-  ctx.font = '16px Inter, sans-serif';
-  ctx.fillText('⚠️ आवेदन से पहले आधिकारिक NIT और शर्तें जरूर जांचें', 540, y);
+  ctx.font = '14px sans-serif';
+  ctx.fillText('Please verify all details from the official NIT before applying', 540, y);
 
   // Bottom branding section (only if configured)
   if (settings.showBranding && settings.companyName) {
@@ -164,12 +174,12 @@ export async function generateBanner(
 
     ctx.textAlign = 'center';
     ctx.fillStyle = '#d4a017';
-    ctx.font = 'bold 28px Inter, sans-serif';
+    ctx.font = 'bold 26px sans-serif';
     ctx.fillText(settings.companyName, 540, 1280);
 
     if (settings.companyTagline) {
       ctx.fillStyle = '#ffffff';
-      ctx.font = '16px Inter, sans-serif';
+      ctx.font = '16px sans-serif';
       ctx.fillText(settings.companyTagline, 540, 1308);
     }
   }
@@ -178,9 +188,13 @@ export async function generateBanner(
   ctx.fillStyle = '#d4a017';
   ctx.fillRect(60, 1330, 960, 6);
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
-      resolve(blob!);
+      if (blob) {
+        resolve(blob);
+      } else {
+        reject(new Error('Failed to generate PNG blob'));
+      }
     }, 'image/png');
   });
 }
