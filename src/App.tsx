@@ -1283,80 +1283,152 @@ function PostModal({ tender, settings, onClose, onCopy }: {
 function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: {
   tender: Tender; settings: AppSettings; onClose: () => void; onCopyBanner: () => void; onMarkCopied: () => void;
 }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [bannerReady, setBannerReady] = useState(false);
+  // FIX: Use <img> tag directly with blob URL instead of broken double-canvas approach.
+  // The previous implementation tried to draw onto a canvas that wasn't yet in the DOM,
+  // causing the UI to hang on "Generating banner..." indefinitely.
+  const [bannerUrl, setBannerUrl] = useState<string | null>(null);
   const [bannerError, setBannerError] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [dimensions, setDimensions] = useState<{ w: number; h: number } | null>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
 
   useEffect(() => {
+    let objectUrl: string | null = null;
+    let cancelled = false;
+
     const generate = async () => {
+      setIsLoading(true);
+      setBannerError('');
+      setBannerUrl(null);
+      setDimensions(null);
+
       try {
         const blob = await generateBanner(tender, settings);
-        const url = URL.createObjectURL(blob);
-        const img = new window.Image();
-        img.onload = () => {
-          if (canvasRef.current) {
-            const ctx = canvasRef.current.getContext('2d')!;
-            canvasRef.current.width = img.width;
-            canvasRef.current.height = img.height;
-            ctx.drawImage(img, 0, 0);
-            setBannerReady(true);
-          }
-          URL.revokeObjectURL(url);
-        };
-        img.onerror = () => {
-          setBannerError('Failed to load banner image. Please try downloading instead.');
-          URL.revokeObjectURL(url);
-        };
-        img.src = url;
-      } catch (e) {
+        if (cancelled) return;
+
+        // Verify the blob is a valid PNG
+        if (!blob || blob.size === 0) {
+          setBannerError('Banner generation returned an empty file.');
+          setIsLoading(false);
+          return;
+        }
+
+        objectUrl = URL.createObjectURL(blob);
+        setBannerUrl(objectUrl);
+      } catch (e: any) {
+        if (cancelled) return;
         console.error('Banner generation failed:', e);
-        setBannerError('Failed to generate banner. Please try again.');
+        setBannerError(`Failed to generate banner: ${e?.message || 'Unknown error'}`);
+        setIsLoading(false);
       }
     };
+
     generate();
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
   }, [tender, settings]);
 
-  const handleDownload = async () => {
+  // Verify dimensions once the image loads
+  const handleImageLoad = () => {
+    if (imgRef.current) {
+      const w = imgRef.current.naturalWidth;
+      const h = imgRef.current.naturalHeight;
+      setDimensions({ w, h });
+      if (w !== 1080 || h !== 1350) {
+        setBannerError(`Warning: Banner dimensions are ${w}×${h}, expected 1080×1350.`);
+      }
+    }
+    setIsLoading(false);
+  };
+
+  const handleImageError = () => {
+    setBannerError('Failed to render the generated banner image.');
+    setIsLoading(false);
+  };
+
+  const handleDownload = () => {
+    if (!bannerUrl) {
+      setBannerError('No banner available to download. Please regenerate.');
+      return;
+    }
     try {
-      const blob = await generateBanner(tender, settings);
-      const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
-      link.href = url;
-      link.download = `banner_${tender.tenderId}.png`;
+      link.href = bannerUrl;
+      // Sanitize tender ID for filename
+      const safeId = (tender.tenderId || 'tender').replace(/[^a-zA-Z0-9_-]/g, '_');
+      link.download = `banner_${safeId}.png`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    } catch (e) {
+    } catch (e: any) {
       console.error('Download failed:', e);
-      setBannerError('Download failed. Please try again.');
+      setBannerError(`Download failed: ${e?.message || 'Unknown error'}`);
     }
   };
 
   return (
     <div className="fixed inset-0 bg-black/50 z-40 flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-white rounded-xl shadow-2xl max-w-md w-full max-h-[90vh] overflow-hidden" onClick={e => e.stopPropagation()}>
-        <div className="p-4 border-b border-slate-200 flex items-center justify-between">
-          <h3 className="font-bold text-navy-800">Banner Preview (1080×1350)</h3>
+      <div className="bg-white rounded-xl shadow-2xl max-w-md w-full max-h-[90vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="p-4 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
+          <div>
+            <h3 className="font-bold text-navy-800">Banner Preview</h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              {dimensions ? `${dimensions.w}×${dimensions.h} px • PNG` : '1080×1350 px target'}
+            </p>
+          </div>
           <button onClick={onClose} className="p-1 hover:bg-slate-100 rounded"><X className="w-5 h-5" /></button>
         </div>
-        <div className="p-4 overflow-y-auto flex justify-center">
-          {bannerError ? (
-            <div className="text-red-600 text-sm py-8 text-center">{bannerError}</div>
-          ) : !bannerReady ? (
-            <div className="text-slate-500 text-sm py-8">Generating banner...</div>
-          ) : (
-            <canvas ref={canvasRef} className="max-w-full h-auto rounded-lg shadow-md border border-slate-200" style={{ maxHeight: '50vh' }} />
-          )}
+        <div className="p-4 overflow-y-auto flex justify-center flex-1 min-h-[200px]">
+          {bannerError && !bannerUrl ? (
+            <div className="text-red-600 text-sm py-8 text-center max-w-xs">
+              <AlertTriangle className="w-8 h-8 mx-auto mb-2 text-red-500" />
+              {bannerError}
+            </div>
+          ) : isLoading ? (
+            <div className="text-slate-500 text-sm py-8 text-center">
+              <RefreshCw className="w-6 h-6 mx-auto mb-2 animate-spin text-navy-700" />
+              Generating banner...
+            </div>
+          ) : bannerUrl ? (
+            <div className="flex flex-col items-center gap-2">
+              <img
+                ref={imgRef}
+                src={bannerUrl}
+                alt={`Banner for tender ${tender.tenderId}`}
+                onLoad={handleImageLoad}
+                onError={handleImageError}
+                className="max-w-full h-auto rounded-lg shadow-md border border-slate-200"
+                style={{ maxHeight: '55vh' }}
+              />
+              {bannerError && (
+                <div className="text-amber-600 text-xs text-center">{bannerError}</div>
+              )}
+            </div>
+          ) : null}
         </div>
-        <div className="p-4 border-t border-slate-200 flex flex-wrap gap-2">
-          <button onClick={onCopyBanner} className="flex-1 px-3 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition flex items-center justify-center gap-1">
+        <div className="p-4 border-t border-slate-200 flex flex-wrap gap-2 flex-shrink-0">
+          <button
+            onClick={onCopyBanner}
+            disabled={!bannerUrl}
+            className="flex-1 px-3 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
             <Copy className="w-3.5 h-3.5" /> Copy
           </button>
-          <button onClick={handleDownload} className="flex-1 px-3 py-2 bg-navy-700 text-white rounded-lg text-sm font-medium hover:bg-navy-800 transition flex items-center justify-center gap-1">
-            <Download className="w-3.5 h-3.5" /> Download
+          <button
+            onClick={handleDownload}
+            disabled={!bannerUrl}
+            className="flex-1 px-3 py-2 bg-navy-700 text-white rounded-lg text-sm font-medium hover:bg-navy-800 transition flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Download className="w-3.5 h-3.5" /> Download PNG
           </button>
-          <button onClick={onMarkCopied} className="flex-1 px-3 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 transition flex items-center justify-center gap-1">
+          <button
+            onClick={onMarkCopied}
+            disabled={!bannerUrl}
+            className="flex-1 px-3 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 transition flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
             <Check className="w-3.5 h-3.5" /> Mark Copied
           </button>
         </div>
