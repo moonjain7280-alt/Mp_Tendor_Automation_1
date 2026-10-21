@@ -86,7 +86,7 @@ export default function App() {
           const newTenders = result.tenders.filter(t => !existingIds.has(t.tenderId));
           return [...newTenders, ...prev];
         });
-        const statsInfo = result.stats ? ` (${result.stats.parsed} parsed, ${result.stats.rejected} rejected)` : '';
+        const statsInfo = result.stats ? ` (${result.stats.parsed} parsed, ${result.stats.rejected} rejected, ${result.stats.pagesVisited || 1} page(s), ${result.stats.detailPagesSuccess || 0}/${result.stats.detailPagesVisited || 0} details)` : '';
         showNotification(`✅ Successfully imported ${result.tenders.length} real tenders${statsInfo}`, 'success');
       } else {
         showNotification(`⚠️ ${result.message}`, 'warning');
@@ -841,7 +841,7 @@ function ImportView({ onImportComplete, onGoBack }: {
         setPreviewTenders(result.tenders);
         setSelectedIndices(new Set(result.tenders.map((_, i) => i)));
         if (result.stats) setImportStats(result.stats);
-        const statsInfo = result.stats ? ` (Candidates: ${result.stats.candidatesDetected}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected})` : '';
+        const statsInfo = result.stats ? ` (Candidates: ${result.stats.candidatesDetected}, Parsed: ${result.stats.parsed}, Rejected: ${result.stats.rejected}, Pages: ${result.stats.pagesVisited || 1}, Details: ${result.stats.detailPagesSuccess || 0}/${result.stats.detailPagesVisited || 0})` : '';
         setFetchResult(`✅ Found ${result.tenders.length} real tenders from the official portal.${statsInfo}`);
       } else {
         setFetchResult(`⚠️ ${result.message}`);
@@ -1079,7 +1079,7 @@ function ImportView({ onImportComplete, onGoBack }: {
         {importStats && (
           <div className="mt-4 p-4 rounded-lg border bg-slate-50 border-slate-200">
             <h4 className="text-sm font-bold text-slate-700 mb-2">Import Statistics</h4>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 text-xs">
               <div className="bg-white rounded p-2 border">
                 <span className="text-slate-500">Candidates Detected</span>
                 <p className="text-lg font-bold text-navy-700">{importStats.candidatesDetected}</p>
@@ -1095,6 +1095,14 @@ function ImportView({ onImportComplete, onGoBack }: {
               <div className="bg-white rounded p-2 border">
                 <span className="text-slate-500">Rejected</span>
                 <p className="text-lg font-bold text-red-600">{importStats.rejected}</p>
+              </div>
+              <div className="bg-white rounded p-2 border">
+                <span className="text-slate-500">Pages Visited</span>
+                <p className="text-lg font-bold text-blue-600">{importStats.pagesVisited || 1}</p>
+              </div>
+              <div className="bg-white rounded p-2 border">
+                <span className="text-slate-500">Detail Pages</span>
+                <p className="text-lg font-bold text-purple-600">{importStats.detailPagesSuccess || 0}/{importStats.detailPagesVisited || 0}</p>
               </div>
             </div>
             {importStats.aiUsed && (

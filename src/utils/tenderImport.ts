@@ -2,35 +2,142 @@ import { Tender } from '../types';
 import { v4 as uuidv4 } from 'uuid';
 
 /**
- * MP Tender Data Import Service - AI-Assisted Extraction
+ * MP Tender Data Import Service - Header-Aware Extraction
  * 
- * Hybrid approach:
- * 1. Deterministic HTML/text parsing for structured content
- * 2. AI language model fallback for irregularly formatted text
- * 3. Import preview with editing before saving
+ * Features:
+ * 1. Automatic table header detection and mapping
+ * 2. Detail page extraction (when session allows)
+ * 3. Pagination support
+ * 4. AI-assisted fallback for irregular content
+ * 5. Accurate statistics and preview
  * 
- * LIMITATION DOCUMENTATION:
- * The official MP e-Procurement portal (mptenders.gov.in) uses:
- * - Session-based Tapestry framework (NIC GEP)
- * - CAPTCHA for search operations
- * - Dynamic session tokens in URLs
- * - CORS restrictions that prevent browser-based direct access
+ * REAL PORTAL STRUCTURE (mptenders.gov.in):
+ * - Table: id="table" or class="list_table"
+ * - Header row: class="list_header"
+ * - Data rows: class="even" or class="odd" with id="informal_N"
+ * - Detail links: id="DirectLink" with title in [brackets]
+ * - Ref/ID: [RefNo][TenderID] pattern after the link
+ * - Organisation: Uses || separator
+ * - Pagination: class="list_footer" with linkPage/linkFwd/linkLast
  */
 
 // CORS proxies to try (in order of preference)
 const CORS_PROXIES = [
   'https://api.allorigins.win/raw?url=',
   'https://api.codetabs.com/v1/proxy?quest=',
+  'https://corsproxy.io/?',
 ];
 
 const BASE_URL = 'https://mptenders.gov.in';
-const TENDERS_BY_DATE_URL = `${BASE_URL}/nicgep/app?page=FrontEndListTendersbyDate&service=page`;
+const LISTING_URL = `${BASE_URL}/nicgep/app?page=FrontEndListTendersbyDate&service=page`;
+
+// ============ HEADER MAPPING ============
+
+/** Maps known header variations to internal field names */
+const HEADER_SYNONYMS: Record<string, string> = {
+  // Serial number
+  's.no': 'serialNo',
+  's.no.': 'serialNo',
+  'sr.no': 'serialNo',
+  'sr.no.': 'serialNo',
+  'sl.no': 'serialNo',
+  'sl.no.': 'serialNo',
+  'serial': 'serialNo',
+  '#': 'serialNo',
+  
+  // Published date
+  'e-published date': 'publishDate',
+  'published date': 'publishDate',
+  'publish date': 'publishDate',
+  'epublished date': 'publishDate',
+  'date of publication': 'publishDate',
+  'issue date': 'publishDate',
+  
+  // Closing date
+  'bid submission closing date': 'closingDate',
+  'closing date': 'closingDate',
+  'bid closing date': 'closingDate',
+  'submission closing date': 'closingDate',
+  'bid submission end date': 'closingDate',
+  'submission deadline': 'closingDate',
+  'end date': 'closingDate',
+  'last date': 'closingDate',
+  
+  // Opening date
+  'tender opening date': 'openingDate',
+  'opening date': 'openingDate',
+  'bid opening date': 'openingDate',
+  'technical bid opening date': 'openingDate',
+  
+  // Title
+  'title and ref.no./tender id': 'titleColumn',
+  'title and ref.no./tenderid': 'titleColumn',
+  'title and ref no/tender id': 'titleColumn',
+  'title': 'titleColumn',
+  'tender title': 'titleColumn',
+  'work name': 'titleColumn',
+  'subject': 'titleColumn',
+  'description': 'titleColumn',
+  'name of work': 'titleColumn',
+  
+  // Organisation
+  'organisation chain': 'organisation',
+  'organization chain': 'organisation',
+  'organisation': 'organisation',
+  'organization': 'organisation',
+  'department': 'organisation',
+  'dept': 'organisation',
+  'agency': 'organisation',
+  'authority': 'organisation',
+  
+  // Reference
+  'ref.no.': 'referenceNumber',
+  'ref no.': 'referenceNumber',
+  'ref no': 'referenceNumber',
+  'reference no.': 'referenceNumber',
+  'reference number': 'referenceNumber',
+  'nit number': 'referenceNumber',
+  'nit no.': 'referenceNumber',
+  'nit no': 'referenceNumber',
+  
+  // Tender ID
+  'tender id': 'tenderId',
+  'tenderid': 'tenderId',
+  'tender identifier': 'tenderId',
+  
+  // Value
+  'tender value': 'tenderValue',
+  'estimated cost': 'tenderValue',
+  'estimated value': 'tenderValue',
+  'cost': 'tenderValue',
+  'amount': 'tenderValue',
+  'contract value': 'tenderValue',
+  
+  // EMD
+  'emd': 'emd',
+  'emd amount': 'emd',
+  'earnest money': 'emd',
+  'earnest money deposit': 'emd',
+  
+  // Location
+  'location': 'location',
+  'district': 'location',
+  'place': 'location',
+  'place of work': 'location',
+  
+  // Type
+  'tender type': 'tenderType',
+  'type': 'tenderType',
+  'form of contract': 'contractType',
+};
+
+// ============ INTERFACES ============
 
 export interface ImportResult {
   success: boolean;
   tenders: Tender[];
   message: string;
-  source: 'cors_proxy' | 'html_paste' | 'text_import' | 'csv_import' | 'ai_assisted';
+  source: 'cors_proxy' | 'html_paste' | 'text_import' | 'csv_import' | 'ai_assisted' | 'auto_fetch';
   timestamp: string;
   stats?: ImportStats;
 }
@@ -45,10 +152,229 @@ export interface ImportStats {
   missingFields: Record<string, number>;
   aiUsed: boolean;
   aiProvider?: string;
+  pagesVisited: number;
+  detailPagesVisited: number;
+  detailPagesSuccess: number;
+  headerMap?: Record<string, string>;
 }
 
-export interface CandidateTender {
-  id: string;
+export interface FetchProgress {
+  currentPage: number;
+  totalPages: number;
+  rowsFound: number;
+  status: string;
+}
+
+// ============ MAIN FETCH FUNCTION ============
+
+/**
+ * Attempt to fetch live tenders with full header detection, pagination, and detail extraction.
+ */
+export async function fetchLiveTenders(
+  onProgress?: (progress: FetchProgress) => void
+): Promise<ImportResult> {
+  const timestamp = new Date().toISOString();
+  const allTenders: Tender[] = [];
+  const seenIds = new Set<string>();
+  let pagesVisited = 0;
+  let detailPagesVisited = 0;
+  let detailPagesSuccess = 0;
+  let headerMap: Record<string, string> = {};
+  const maxPages = 5; // Configurable limit
+  
+  // Try direct fetch first, then CORS proxies
+  let html = '';
+  let fetchSource: ImportResult['source'] = 'auto_fetch';
+  
+  // Try direct fetch
+  try {
+    const response = await fetch(LISTING_URL, { 
+      signal: AbortSignal.timeout(10000),
+      mode: 'cors'
+    });
+    if (response.ok) {
+      html = await response.text();
+      fetchSource = 'auto_fetch';
+    }
+  } catch (e) {
+    console.warn('Direct fetch failed, trying CORS proxies...');
+  }
+  
+  // Try CORS proxies
+  if (!html) {
+    for (const proxy of CORS_PROXIES) {
+      try {
+        onProgress?.({ currentPage: 0, totalPages: 1, rowsFound: 0, status: `Trying ${proxy.split('/')[2]}...` });
+        const url = `${proxy}${encodeURIComponent(LISTING_URL)}`;
+        const response = await fetch(url, { 
+          signal: AbortSignal.timeout(15000) 
+        });
+        
+        if (!response.ok) continue;
+        
+        const proxyHtml = await response.text();
+        
+        // Validate it's actually the tender page
+        if (proxyHtml.includes('list_table') || proxyHtml.includes('DirectLink') || proxyHtml.includes('FrontEndListTendersbyDate')) {
+          html = proxyHtml;
+          fetchSource = 'cors_proxy';
+          break;
+        }
+      } catch (e) {
+        console.warn(`Proxy ${proxy} failed:`, e);
+        continue;
+      }
+    }
+  }
+  
+  if (!html) {
+    return {
+      success: false,
+      tenders: [],
+      message: 'Could not access the official portal. All CORS proxies timed out or returned errors. Please use the "Paste HTML" method: Go to mptenders.gov.in → Tenders by Closing Date → Right-click the tender table → Inspect → Copy outer HTML → Paste in the import box.',
+      source: 'cors_proxy',
+      timestamp
+    };
+  }
+  
+  // Parse the listing page with header detection
+  onProgress?.({ currentPage: 1, totalPages: 1, rowsFound: 0, status: 'Parsing listing page...' });
+  
+  const page1Result = parseListingPage(html);
+  headerMap = page1Result.headerMap;
+  
+  // Process tenders from page 1
+  for (const candidate of page1Result.candidates) {
+    const id = candidate.tenderId || candidate.referenceNumber;
+    if (id && seenIds.has(id)) continue;
+    if (id) seenIds.add(id);
+    
+    const tender = candidateToTender(candidate);
+    
+    // Try to fetch detail page for additional info
+    if (candidate.detailUrl) {
+      detailPagesVisited++;
+      onProgress?.({ currentPage: 1, totalPages: 1, rowsFound: allTenders.length, status: `Fetching detail page ${detailPagesVisited}...` });
+      
+      try {
+        const detailData = await fetchTenderDetail(candidate.detailUrl);
+        if (detailData) {
+          detailPagesSuccess++;
+          mergeDetailData(tender, detailData);
+        }
+      } catch (e) {
+        console.warn('Detail page fetch failed:', e);
+      }
+    }
+    
+    allTenders.push(tender);
+  }
+  
+  pagesVisited = 1;
+  
+  // Pagination: detect and follow next pages
+  const paginationLinks = detectPaginationLinks(html);
+  const pagesToVisit = Math.min(paginationLinks.length, maxPages - 1);
+  
+  for (let i = 0; i < pagesToVisit; i++) {
+    const pageUrl = paginationLinks[i];
+    onProgress?.({ 
+      currentPage: i + 2, 
+      totalPages: paginationLinks.length + 1, 
+      rowsFound: allTenders.length, 
+      status: `Fetching page ${i + 2}...` 
+    });
+    
+    try {
+      let pageHtml = '';
+      
+      // Try direct fetch for pagination links
+      try {
+        const resp = await fetch(pageUrl, { signal: AbortSignal.timeout(10000), mode: 'cors' });
+        if (resp.ok) pageHtml = await resp.text();
+      } catch {}
+      
+      // Try via proxy
+      if (!pageHtml) {
+        for (const proxy of CORS_PROXIES) {
+          try {
+            const proxyUrl = `${proxy}${encodeURIComponent(pageUrl)}`;
+            const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(15000) });
+            if (resp.ok) {
+              const pHtml = await resp.text();
+              if (pHtml.includes('list_table') || pHtml.includes('DirectLink')) {
+                pageHtml = pHtml;
+                break;
+              }
+            }
+          } catch { continue; }
+        }
+      }
+      
+      if (pageHtml) {
+        pagesVisited++;
+        const pageResult = parseListingPage(pageHtml);
+        
+        let newOnThisPage = 0;
+        for (const candidate of pageResult.candidates) {
+          const id = candidate.tenderId || candidate.referenceNumber;
+          if (id && seenIds.has(id)) continue;
+          if (id) seenIds.add(id);
+          
+          const tender = candidateToTender(candidate);
+          allTenders.push(tender);
+          newOnThisPage++;
+        }
+        
+        // Stop if no new tenders found (likely same data or session expired)
+        if (newOnThisPage === 0) break;
+      }
+    } catch (e) {
+      console.warn(`Pagination page ${i + 2} failed:`, e);
+      break;
+    }
+  }
+  
+  // Build stats
+  const stats: ImportStats = {
+    totalRows: page1Result.totalRows,
+    candidatesDetected: page1Result.candidates.length,
+    parsed: allTenders.length,
+    rejected: page1Result.rejected,
+    needsReview: allTenders.filter(t => t.tenderId === 'PENDING-IMPORT').length,
+    duplicates: seenIds.size < page1Result.candidates.length ? page1Result.candidates.length - seenIds.size : 0,
+    missingFields: computeMissingFields(allTenders),
+    aiUsed: false,
+    pagesVisited,
+    detailPagesVisited,
+    detailPagesSuccess,
+    headerMap
+  };
+  
+  if (allTenders.length > 0) {
+    return {
+      success: true,
+      tenders: allTenders,
+      message: `Fetched ${allTenders.length} tenders from ${pagesVisited} page(s). ${detailPagesSuccess}/${detailPagesVisited} detail pages accessible.`,
+      source: fetchSource,
+      timestamp,
+      stats
+    };
+  }
+  
+  return {
+    success: false,
+    tenders: [],
+    message: 'Portal page was accessible but no tender rows could be parsed. The page structure may have changed. Use the "Paste HTML" method as fallback.',
+    source: fetchSource,
+    timestamp,
+    stats
+  };
+}
+
+// ============ HEADER-AWARE LISTING PARSER ============
+
+interface ParsedCandidate {
   tenderId: string;
   referenceNumber: string;
   workName: string;
@@ -60,628 +386,124 @@ export interface CandidateTender {
   publishedDate: string;
   bidOpeningDate: string;
   officialUrl: string;
+  detailUrl: string;
   organisationChain: string;
-  eligibility: string;
-  tenderFee: string;
-  originalSourceText: string;
-  confidence: 'high' | 'medium' | 'low';
-  needsReview: boolean;
-  reviewReason?: string;
+  serialNo: string;
+  extraFields: Record<string, string>;
+}
+
+interface ListingParseResult {
+  candidates: ParsedCandidate[];
+  totalRows: number;
+  rejected: number;
+  headerMap: Record<string, string>;
 }
 
 /**
- * Attempt to fetch live tenders via CORS proxy.
+ * Parse a listing page with automatic header detection.
+ * This handles the actual mptenders.gov.in table structure.
  */
-export async function fetchLiveTenders(): Promise<ImportResult> {
-  const timestamp = new Date().toISOString();
+export function parseListingPage(html: string): ListingParseResult {
+  const candidates: ParsedCandidate[] = [];
+  let totalRows = 0;
+  let rejected = 0;
+  const headerMap: Record<string, string> = {};
   
-  for (const proxy of CORS_PROXIES) {
-    try {
-      const url = `${proxy}${encodeURIComponent(TENDERS_BY_DATE_URL)}`;
-      const response = await fetch(url, { 
-        signal: AbortSignal.timeout(15000) 
-      });
-      
-      if (!response.ok) continue;
-      
-      const html = await response.text();
-      const result = parsePastedContent(html);
-      
-      if (result.tenders.length > 0) {
-        return {
-          success: true,
-          ...result,
-          message: `Successfully fetched ${result.tenders.length} real tenders from official portal via proxy.`,
-          source: 'cors_proxy',
-          timestamp
-        };
-      }
-    } catch (e) {
-      console.warn(`Proxy ${proxy} failed:`, e);
-      continue;
-    }
-  }
-
-  return {
-    success: false,
-    tenders: [],
-    message: 'Could not access the official portal directly. The government website blocks automated requests from browsers. Please use the "Import from HTML" option: Go to mptenders.gov.in → Tenders by Closing Date → Copy the page content → Paste it in the import box.',
-    source: 'cors_proxy',
-    timestamp
-  };
-}
-
-/**
- * Parse pasted HTML/text from the user.
- * Uses a multi-strategy approach:
- * 1. HTML DOM parsing (most reliable for actual HTML)
- * 2. HTML regex parsing (for malformed HTML)
- * 3. Structured text parsing (key-value pairs)
- * 4. Block-based text parsing (for copy-pasted content)
- * 5. AI-assisted fallback (if configured)
- */
-export function parsePastedContent(content: string): { tenders: Tender[]; stats: ImportStats } {
-  const emptyStats: ImportStats = {
-    totalRows: 0,
-    candidatesDetected: 0,
-    parsed: 0,
-    rejected: 0,
-    needsReview: 0,
-    duplicates: 0,
-    missingFields: {},
-    aiUsed: false
-  };
-
-  if (!content || !content.trim()) {
-    return { tenders: [], stats: emptyStats };
-  }
-
-  // Strategy 1: HTML DOM parsing
-  let result = parseHTMLWithDOM(content);
-  if (result.stats.candidatesDetected >= 3) return result;
-
-  // Strategy 2: HTML regex parsing
-  result = parseHTMLWithRegex(content);
-  if (result.stats.candidatesDetected >= 3) return result;
-
-  // Strategy 3: Structured text parsing (key-value format)
-  result = parseStructuredText(content);
-  if (result.stats.candidatesDetected >= 3) return result;
-
-  // Strategy 4: Block-based text parsing (flexible)
-  result = parseBlockText(content);
-  if (result.stats.candidatesDetected >= 1) return result;
-
-  // Strategy 5: Aggressive line-by-line parsing
-  result = parseAggressiveText(content);
-  
-  return result;
-}
-
-/**
- * Parse HTML using DOMParser - most reliable method.
- */
-function parseHTMLWithDOM(html: string): { tenders: Tender[]; stats: ImportStats } {
-  const tenders: Tender[] = [];
-  const stats: ImportStats = {
-    totalRows: 0,
-    candidatesDetected: 0,
-    parsed: 0,
-    rejected: 0,
-    needsReview: 0,
-    duplicates: 0,
-    missingFields: {},
-    aiUsed: false
-  };
-
   try {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
     
-    // Find all tables
-    const tables = doc.querySelectorAll('table');
+    // Find the main tender table
+    const table = doc.querySelector('table.list_table') || 
+                  doc.querySelector('table#table') ||
+                  doc.querySelector('table.list');
     
-    for (const table of tables) {
-      const rows = table.querySelectorAll('tr');
-      
-      for (const row of rows) {
-        stats.totalRows++;
-        const cells = row.querySelectorAll('td');
-        
-        // Skip header rows or rows with too few cells
-        if (cells.length < 3) continue;
-        
-        // Look for tender links in any cell
-        const links = row.querySelectorAll('a[href*="mptenders.gov.in"]');
-        
-        if (links.length > 0) {
-          stats.candidatesDetected++;
-          const tender = extractTenderFromRow(row, cells, links);
-          if (tender) {
-            tenders.push(tender);
-            stats.parsed++;
-            
-            // Track missing fields
-            if (!tender.tenderAmount) stats.missingFields['tenderAmount'] = (stats.missingFields['tenderAmount'] || 0) + 1;
-            if (!tender.emd) stats.missingFields['emd'] = (stats.missingFields['emd'] || 0) + 1;
-            if (!tender.lastDate) stats.missingFields['lastDate'] = (stats.missingFields['lastDate'] || 0) + 1;
-            if (!tender.district || tender.district === 'Not specified in source') stats.missingFields['district'] = (stats.missingFields['district'] || 0) + 1;
-          } else {
-            stats.rejected++;
-          }
+    if (!table) {
+      // Fallback: try to find any table with tender-like content
+      const allTables = doc.querySelectorAll('table');
+      for (const t of allTables) {
+        if (t.innerHTML.includes('DirectLink') || t.innerHTML.includes('list_header')) {
+          return parseListingPageFromTable(t);
         }
       }
+      return { candidates, totalRows, rejected, headerMap };
     }
     
-    // If no tables found, try parsing the entire document for tender patterns
-    if (tenders.length === 0) {
-      const allLinks = doc.querySelectorAll('a[href*="component=%24DirectLink"], a[href*="mptenders.gov.in"]');
-      for (const link of allLinks) {
-        const title = link.textContent?.trim();
-        const url = link.getAttribute('href');
-        
-        if (title && title.length > 10 && url) {
-          stats.candidatesDetected++;
-          // Look for reference numbers near this link
-          const parent = link.parentElement;
-          const parentText = parent?.textContent || '';
-          const refMatch = parentText.match(/\[([^\]]+)\]\[([^\]]+)\]/);
-          
-          tenders.push({
-            id: uuidv4(),
-            tenderId: refMatch ? refMatch[2] : 'PENDING-IMPORT',
-            workName: title,
-            department: extractDepartmentFromText(parentText),
-            district: extractDistrictFromText(parentText) || 'Not specified in source',
-            tenderAmount: '',
-            emd: '',
-            lastDate: extractDateFromText(parentText),
-            officialUrl: url.startsWith('http') ? url : BASE_URL + url,
-            dataSource: 'imported',
-            textCopied: false,
-            bannerCopied: false,
-            manuallyPublished: false,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            eligibility: '',
-            tenderFee: '',
-            publishedDate: '',
-            bidOpeningDate: '',
-            organisationChain: extractOrgChainFromText(parentText),
-            notes: `Imported from pasted HTML on ${new Date().toLocaleDateString()}.`
-          });
-          stats.parsed++;
-        }
-      }
-    }
+    return parseListingPageFromTable(table);
   } catch (e) {
-    console.error('DOM parsing failed:', e);
+    console.error('Listing page parse error:', e);
+    return { candidates, totalRows, rejected, headerMap };
   }
-
-  return { tenders, stats };
-}
-
-/**
- * Extract tender data from a table row.
- */
-function extractTenderFromRow(row: Element, cells: NodeListOf<Element>, links: NodeListOf<Element>): Tender | null {
-  const titleLink = links[0];
-  const title = titleLink.textContent?.trim() || '';
-  const url = titleLink.getAttribute('href') || '';
   
-  if (title.length < 10) return null;
-  
-  const rowText = row.textContent || '';
-  
-  // Extract reference numbers [RefNo][TenderID]
-  const refMatch = rowText.match(/\[([^\]]+)\]\[([^\]]+)\]/);
-  const tenderRef = refMatch ? refMatch[1] : '';
-  const tenderId = refMatch ? refMatch[2] : '';
-  
-  // Extract dates
-  const dates = extractAllDates(rowText);
-  
-  // Extract organisation chain
-  const orgChain = extractOrgChainFromText(rowText);
-  
-  return {
-    id: uuidv4(),
-    tenderId: tenderId || tenderRef || 'PENDING-IMPORT',
-    workName: title,
-    department: extractDepartmentFromText(rowText) || orgChain || 'Not specified in source',
-    district: extractDistrictFromText(rowText) || 'Not specified in source',
-    tenderAmount: extractTenderValue(rowText),
-    emd: extractEMD(rowText),
-    lastDate: dates.closingDate || '',
-    officialUrl: url.startsWith('http') ? url : BASE_URL + url,
-    dataSource: 'imported',
-    textCopied: false,
-    bannerCopied: false,
-    manuallyPublished: false,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    eligibility: '',
-    tenderFee: extractTenderFee(rowText),
-    publishedDate: dates.publishedDate || '',
-    bidOpeningDate: dates.openingDate || '',
-    organisationChain: orgChain,
-    notes: `Imported from official portal listing on ${new Date().toLocaleDateString()}.`
-  };
-}
-
-/**
- * Parse HTML using regex - fallback method.
- */
-function parseHTMLWithRegex(html: string): { tenders: Tender[]; stats: ImportStats } {
-  const tenders: Tender[] = [];
-  const stats: ImportStats = {
-    totalRows: 0,
-    candidatesDetected: 0,
-    parsed: 0,
-    rejected: 0,
-    needsReview: 0,
-    duplicates: 0,
-    missingFields: {},
-    aiUsed: false
-  };
-
-  // Split by table rows or by tender-like blocks
-  const rows = html.split(/<tr[^>]*>/i);
-  
-  for (const row of rows) {
-    stats.totalRows++;
+  function parseListingPageFromTable(table: Element): ListingParseResult {
+    const result: ListingParseResult = { candidates: [], totalRows: 0, rejected: 0, headerMap: {} };
     
-    // Look for tender links - more flexible pattern
-    const linkPatterns = [
-      /<a[^>]+href="([^"]*component=%24DirectLink[^"]*)"[^>]*>([^<]+)<\/a>/i,
-      /<a[^>]+href="([^"]*mptenders\.gov\.in[^"]*)"[^>]*>([^<]{10,})<\/a>/i,
-      /\[([^\]]{10,})\]\((https?:\/\/mptenders\.gov\.in[^)]+)\s*(?:"[^"]*")?\)/,
-    ];
+    // Step 1: Detect headers
+    const headerRow = table.querySelector('tr.list_header') || table.querySelector('thead tr') || table.querySelector('tr:first-child');
+    const columnMap: Record<number, string> = {};
     
-    let title = '';
-    let url = '';
-    
-    for (const pattern of linkPatterns) {
-      const match = row.match(pattern);
-      if (match) {
-        if (pattern.source.includes('\\\\]\\\\(')) {
-          title = cleanHTML(match[1]);
-          url = match[2];
-        } else {
-          url = match[1];
-          title = cleanHTML(match[2]);
-        }
-        break;
-      }
-    }
-    
-    if (title && title.length > 10) {
-      stats.candidatesDetected++;
-      // Extract reference numbers
-      const refMatch = row.match(/\[([^\]]+)\]\[([^\]]+)\]/);
-      const tenderRef = refMatch ? cleanHTML(refMatch[1]) : '';
-      const tenderId = refMatch ? cleanHTML(refMatch[2]) : '';
-      
-      // Extract dates
-      const dates = extractAllDates(row);
-      
-      // Extract organisation
-      const orgChain = extractOrgChainFromText(row);
-      
-      tenders.push({
-        id: uuidv4(),
-        tenderId: tenderId || tenderRef || 'PENDING-IMPORT',
-        workName: title,
-        department: extractDepartmentFromText(row) || orgChain || 'Not specified in source',
-        district: extractDistrictFromText(row) || 'Not specified in source',
-        tenderAmount: extractTenderValue(row),
-        emd: extractEMD(row),
-        lastDate: dates.closingDate || '',
-        officialUrl: url || BASE_URL,
-        dataSource: 'imported',
-        textCopied: false,
-        bannerCopied: false,
-        manuallyPublished: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        eligibility: '',
-        tenderFee: extractTenderFee(row),
-        publishedDate: dates.publishedDate || '',
-        bidOpeningDate: dates.openingDate || '',
-        organisationChain: orgChain,
-        notes: `Imported from official portal listing on ${new Date().toLocaleDateString()}.`
-      });
-      stats.parsed++;
-    }
-  }
-
-  return { tenders, stats };
-}
-
-/**
- * Parse structured text with key-value pairs.
- * Handles formats like:
- *   Tender ID: 12345
- *   Title: Construction work
- *   Department: PWD
- *   Closing Date: 22-Oct-2026
- */
-function parseStructuredText(text: string): { tenders: Tender[]; stats: ImportStats } {
-  const tenders: Tender[] = [];
-  const stats: ImportStats = {
-    totalRows: 0,
-    candidatesDetected: 0,
-    parsed: 0,
-    rejected: 0,
-    needsReview: 0,
-    duplicates: 0,
-    missingFields: {},
-    aiUsed: false
-  };
-
-  // Detect if this looks like structured key-value format
-  const kvPattern = /(Tender\s*(?:ID|Reference|Value|Title)|NIT\s*Number|Reference\s*Number|Organisation|Department|Closing\s*Date|Title|District|Location|Tender\s*Value)/i;
-  
-  if (!kvPattern.test(text)) {
-    return { tenders, stats };
-  }
-
-  // Split into blocks by double newlines or by repeated key patterns
-  const blocks = splitIntoTenderBlocks(text);
-  
-  for (const block of blocks) {
-    stats.totalRows++;
-    const candidate = extractFromKeyValueBlock(block);
-    
-    if (candidate && candidate.workName && candidate.workName.length > 5) {
-      stats.candidatesDetected++;
-      const tender = candidateToTender(candidate);
-      tenders.push(tender);
-      stats.parsed++;
-      
-      if (candidate.needsReview) {
-        stats.needsReview++;
-      }
-    }
-  }
-
-  return { tenders, stats };
-}
-
-/**
- * Parse block-based text - handles copy-pasted content with various formats.
- * This is the most flexible parser for real-world tender text.
- */
-function parseBlockText(text: string): { tenders: Tender[]; stats: ImportStats } {
-  const tenders: Tender[] = [];
-  const stats: ImportStats = {
-    totalRows: 0,
-    candidatesDetected: 0,
-    parsed: 0,
-    rejected: 0,
-    needsReview: 0,
-    duplicates: 0,
-    missingFields: {},
-    aiUsed: false
-  };
-
-  const blocks = splitIntoTenderBlocks(text);
-  
-  for (const block of blocks) {
-    stats.totalRows++;
-    const candidate = extractFromBlock(block);
-    
-    if (candidate && candidate.workName && candidate.workName.length > 5) {
-      stats.candidatesDetected++;
-      const tender = candidateToTender(candidate);
-      tenders.push(tender);
-      stats.parsed++;
-      
-      if (candidate.needsReview) {
-        stats.needsReview++;
-      }
-      
-      // Track missing fields
-      if (!tender.tenderAmount) stats.missingFields['tenderAmount'] = (stats.missingFields['tenderAmount'] || 0) + 1;
-      if (!tender.lastDate) stats.missingFields['lastDate'] = (stats.missingFields['lastDate'] || 0) + 1;
-      if (!tender.district || tender.district === 'Not specified in source') stats.missingFields['district'] = (stats.missingFields['district'] || 0) + 1;
-    }
-  }
-
-  return { tenders, stats };
-}
-
-/**
- * Aggressive text parsing - last resort for very irregular formats.
- */
-function parseAggressiveText(text: string): { tenders: Tender[]; stats: ImportStats } {
-  const tenders: Tender[] = [];
-  const stats: ImportStats = {
-    totalRows: 0,
-    candidatesDetected: 0,
-    parsed: 0,
-    rejected: 0,
-    needsReview: 0,
-    duplicates: 0,
-    missingFields: {},
-    aiUsed: false
-  };
-
-  const lines = text.split('\n').filter(l => l.trim());
-  
-  // Look for tender ID patterns as anchors
-  const tenderIdPatterns = [
-    /\b(\d{4}_\w+_\d+_\d+)\b/g,           // 2026_WRD_517082_1
-    /\b(\d{4}[-\/]\d+[-\/]\d+)\b/g,        // 2026-27/TS-2698/3447
-    /\b(NIT[_\/-]\w+)\b/gi,                 // NIT_Bhopal_01/2026
-    /\b(Tender\s*(?:ID|Ref|No)[.:]?\s*\d+)\b/gi,
-  ];
-
-  // Find all tender ID occurrences
-  const idLocations: { lineIndex: number; id: string }[] = [];
-  
-  for (let i = 0; i < lines.length; i++) {
-    for (const pattern of tenderIdPatterns) {
-      pattern.lastIndex = 0;
-      const match = pattern.exec(lines[i]);
-      if (match) {
-        idLocations.push({ lineIndex: i, id: match[1] });
-      }
-    }
-  }
-
-  // If we found tender IDs, use them as block anchors
-  if (idLocations.length > 0) {
-    for (const loc of idLocations) {
-      stats.totalRows++;
-      // Gather surrounding context (3 lines before and 5 after)
-      const start = Math.max(0, loc.lineIndex - 3);
-      const end = Math.min(lines.length, loc.lineIndex + 6);
-      const block = lines.slice(start, end).join('\n');
-      
-      const candidate = extractFromBlock(block);
-      if (candidate) {
-        // Override tender ID with the one we found
-        if (!candidate.tenderId || candidate.tenderId === 'PENDING-IMPORT') {
-          candidate.tenderId = loc.id;
-        }
-        stats.candidatesDetected++;
-        const tender = candidateToTender(candidate);
-        tenders.push(tender);
-        stats.parsed++;
-        if (candidate.needsReview) stats.needsReview++;
-      }
-    }
-  }
-
-  // If no IDs found, try to detect blocks by long text lines (likely titles)
-  if (tenders.length === 0) {
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i].trim();
-      stats.totalRows++;
-      
-      // A line that's long enough to be a title and not a date/reference
-      if (line.length > 30 && !isDateOrReferenceLine(line)) {
-        stats.candidatesDetected++;
-        // Gather context
-        const start = Math.max(0, i - 2);
-        const end = Math.min(lines.length, i + 8);
-        const block = lines.slice(start, end).join('\n');
+    if (headerRow) {
+      const headerCells = headerRow.querySelectorAll('td, th');
+      headerCells.forEach((cell, index) => {
+        const rawText = cell.textContent?.trim().toLowerCase() || '';
+        const normalized = normalizeHeaderText(rawText);
+        const fieldName = mapHeaderToField(normalized);
         
-        const candidate = extractFromBlock(block);
-        if (candidate) {
-          const tender = candidateToTender(candidate);
-          tenders.push(tender);
-          stats.parsed++;
-          if (candidate.needsReview) stats.needsReview++;
-          // Skip past this block
-          i = end;
-          continue;
+        if (fieldName) {
+          columnMap[index] = fieldName;
+          result.headerMap[normalized] = fieldName;
+        } else {
+          // Preserve unknown headers
+          columnMap[index] = `unknown_${index}`;
+          result.headerMap[normalized] = `unknown_${index}`;
         }
+      });
+    }
+    
+    // Step 2: Parse data rows
+    const dataRows = table.querySelectorAll('tr.even, tr.odd, tr[id^="informal"]');
+    
+    // If no class-based rows found, try all rows except header
+    const rowsToProcess = dataRows.length > 0 
+      ? Array.from(dataRows) 
+      : Array.from(table.querySelectorAll('tr')).filter(r => !r.classList.contains('list_header') && !r.classList.contains('list_footer'));
+    
+    for (const row of rowsToProcess) {
+      result.totalRows++;
+      
+      // Skip footer/pagination rows
+      if (row.classList.contains('list_footer')) continue;
+      if (row.querySelector('span#informal_11')) continue; // Pagination container
+      
+      const cells = row.querySelectorAll('td');
+      if (cells.length < 3) {
+        result.rejected++;
+        continue;
       }
-      i++;
+      
+      // Extract data based on column mapping
+      const candidate = extractCandidateFromRow(cells, columnMap, row);
+      
+      if (candidate && candidate.workName && candidate.workName.length > 5) {
+        result.candidates.push(candidate);
+      } else {
+        result.rejected++;
+      }
     }
-  }
-
-  return { tenders, stats };
-}
-
-/**
- * Split text into blocks that likely represent individual tenders.
- * Uses multiple heuristics to find block boundaries.
- */
-function splitIntoTenderBlocks(text: string): string[] {
-  const blocks: string[] = [];
-  
-  // Strategy 1: Split by double newlines (common in copy-paste)
-  const doubleNewlineBlocks = text.split(/\n\s*\n/).filter(b => b.trim().length > 20);
-  
-  // Strategy 2: Split by numbered items (1. 2. 3. etc.)
-  const numberedBlocks = text.split(/\n\s*(?:\d+[\.\)]\s+)/).filter(b => b.trim().length > 20);
-  
-  // Strategy 3: Split by reference number patterns [xxx][xxx]
-  const refBlocks = text.split(/(?=\[[^\]]{5,}\]\[[^\]]{5,}\])/).filter(b => b.trim().length > 20);
-  
-  // Strategy 4: Split by "Tender ID" or similar headers
-  const headerBlocks = text.split(/(?=(?:Tender\s*ID|Reference\s*Number|NIT\s*Number|S\.?No)[.:])/i).filter(b => b.trim().length > 20);
-
-  // Strategy 5: Split by horizontal rules or separator lines
-  const separatorBlocks = text.split(/(?:---+|===+|\*{3,}|_{3,})/).filter(b => b.trim().length > 20);
-  
-  // Choose the strategy that gives the most blocks (likely the correct one)
-  const strategies = [
-    doubleNewlineBlocks,
-    numberedBlocks,
-    refBlocks,
-    headerBlocks,
-    separatorBlocks
-  ];
-  
-  // Find the strategy that produces the most blocks with content
-  let bestBlocks = doubleNewlineBlocks;
-  let bestScore = 0;
-  
-  for (const strategy of strategies) {
-    const score = strategy.length;
-    if (score > bestScore) {
-      bestScore = score;
-      bestBlocks = strategy;
-    }
-  }
-  
-  // If we only got 1 block, try splitting by single newlines with context
-  if (bestBlocks.length <= 1 && text.includes('\n')) {
-    return splitByLinePatterns(text);
-  }
-  
-  return bestBlocks;
-}
-
-/**
- * Split text by line patterns when block splitting fails.
- */
-function splitByLinePatterns(text: string): string[] {
-  const lines = text.split('\n');
-  const blocks: string[] = [];
-  let currentBlock: string[] = [];
-  
-  for (const line of lines) {
-    const trimmed = line.trim();
     
-    // Check if this line starts a new tender
-    const isNewTenderStart = 
-      trimmed.match(/^\d+[\.\)]\s+/) ||
-      trimmed.match(/^Tender\s*(?:ID|Ref)/i) ||
-      trimmed.match(/^NIT\s*Number/i) ||
-      trimmed.match(/^Reference\s*Number/i) ||
-      trimmed.match(/^\[.+\]\[.+\]$/) ||
-      (trimmed.match(/\b\d{4}_\w+_\d+_\d+\b/) && currentBlock.length > 0);
-    
-    if (isNewTenderStart && currentBlock.length > 0) {
-      blocks.push(currentBlock.join('\n'));
-      currentBlock = [line];
-    } else {
-      currentBlock.push(line);
-    }
+    return result;
   }
-  
-  if (currentBlock.length > 0) {
-    blocks.push(currentBlock.join('\n'));
-  }
-  
-  return blocks.filter(b => b.trim().length > 15);
 }
 
 /**
- * Extract tender data from a key-value block.
+ * Extract a candidate tender from a table row using the column mapping.
  */
-function extractFromKeyValueBlock(block: string): CandidateTender | null {
-  const lines = block.split('\n').map(l => l.trim()).filter(l => l);
-  const fullText = block;
-  
-  const candidate: CandidateTender = {
-    id: uuidv4(),
+function extractCandidateFromRow(
+  cells: NodeListOf<Element>, 
+  columnMap: Record<number, string>,
+  row: Element
+): ParsedCandidate | null {
+  const candidate: ParsedCandidate = {
     tenderId: '',
     referenceNumber: '',
     workName: '',
@@ -693,138 +515,112 @@ function extractFromKeyValueBlock(block: string): CandidateTender | null {
     publishedDate: '',
     bidOpeningDate: '',
     officialUrl: '',
+    detailUrl: '',
     organisationChain: '',
-    eligibility: '',
-    tenderFee: '',
-    originalSourceText: block.substring(0, 500),
-    confidence: 'medium',
-    needsReview: false
+    serialNo: '',
+    extraFields: {}
   };
-
-  for (const line of lines) {
-    // Key-value extraction
-    const kvMatch = line.match(/^(.+?)[\s:：]+(.+)$/);
-    if (kvMatch) {
-      const key = kvMatch[1].trim().toLowerCase();
-      const value = kvMatch[2].trim();
-      
-      if (key.match(/tender\s*id|tender\s*identifier/)) {
-        candidate.tenderId = value;
-      } else if (key.match(/reference|ref\s*no|nit\s*number|nit\s*no/)) {
-        candidate.referenceNumber = value;
-      } else if (key.match(/title|work\s*name|subject|description/)) {
-        candidate.workName = value;
-      } else if (key.match(/department|organisation|org/)) {
-        candidate.department = value;
-      } else if (key.match(/district|location|place|city/)) {
-        candidate.district = value;
-      } else if (key.match(/closing\s*date|bid\s*submission|deadline|last\s*date/)) {
-        candidate.lastDate = normalizeDate(value);
-      } else if (key.match(/publish|issued|notification\s*date/)) {
-        candidate.publishedDate = normalizeDate(value);
-      } else if (key.match(/opening|bid\s*opening/)) {
-        candidate.bidOpeningDate = normalizeDate(value);
-      } else if (key.match(/tender\s*value|estimated\s*value|amount|cost/)) {
-        candidate.tenderAmount = value;
-      } else if (key.match(/emd|earnest\s*money|security\s*deposit/)) {
-        candidate.emd = value;
-      } else if (key.match(/eligib/)) {
-        candidate.eligibility = value;
-      } else if (key.match(/fee|document\s*fee/)) {
-        candidate.tenderFee = value;
-      } else if (key.match(/url|link|source/)) {
-        candidate.officialUrl = value;
-      }
+  
+  // Map cells to fields
+  cells.forEach((cell, index) => {
+    const fieldName = columnMap[index];
+    const cellText = cell.textContent?.trim() || '';
+    
+    if (!fieldName) return;
+    
+    switch (fieldName) {
+      case 'serialNo':
+        candidate.serialNo = cellText.replace(/[.\s]/g, '');
+        break;
+      case 'publishDate':
+        candidate.publishedDate = normalizeDate(cellText);
+        break;
+      case 'closingDate':
+        candidate.lastDate = normalizeDate(cellText);
+        break;
+      case 'openingDate':
+        candidate.bidOpeningDate = normalizeDate(cellText);
+        break;
+      case 'titleColumn':
+        // This is the complex column with title link + ref numbers
+        extractTitleColumn(cell, candidate);
+        break;
+      case 'organisation':
+        candidate.organisationChain = cellText;
+        candidate.department = extractDepartmentFromOrg(cellText);
+        candidate.district = extractDistrictFromOrg(cellText);
+        break;
+      case 'tenderValue':
+        candidate.tenderAmount = cellText;
+        break;
+      case 'emd':
+        candidate.emd = cellText;
+        break;
+      case 'location':
+        candidate.district = cellText;
+        break;
+      case 'referenceNumber':
+        candidate.referenceNumber = cellText;
+        break;
+      case 'tenderId':
+        candidate.tenderId = cellText;
+        break;
+      default:
+        if (fieldName.startsWith('unknown_')) {
+          candidate.extraFields[fieldName] = cellText;
+        }
+    }
+  });
+  
+  // Fallback: if titleColumn wasn't mapped, scan all cells for DirectLink
+  if (!candidate.workName) {
+    const links = row.querySelectorAll('a[id^="DirectLink"]');
+    if (links.length > 0) {
+      extractTitleColumn(links[0].parentElement!, candidate);
     }
   }
-
-  // Fallback: extract from full text
-  if (!candidate.tenderId) {
-    const idMatch = fullText.match(/\b(\d{4}_\w+_\d+_\d+)\b/) || fullText.match(/\b(\d{4}[-\/]\w+[-\/]\d+)\b/);
-    if (idMatch) candidate.tenderId = idMatch[1];
-  }
-  if (!candidate.workName) {
-    // Use the longest non-date, non-reference line as title
-    const titleLine = lines.find(l => l.length > 20 && !isDateOrReferenceLine(l) && !l.match(/^[\[\d]/));
-    if (titleLine) candidate.workName = titleLine;
-  }
-  if (!candidate.department) {
-    candidate.department = extractDepartmentFromText(fullText);
-  }
-  if (!candidate.district) {
-    candidate.district = extractDistrictFromText(fullText);
-  }
-  if (!candidate.lastDate) {
-    const dates = extractAllDates(fullText);
-    candidate.lastDate = dates.closingDate;
-  }
-
-  // Determine confidence
-  if (candidate.workName && candidate.tenderId) {
-    candidate.confidence = 'high';
-  } else if (candidate.workName) {
-    candidate.confidence = 'medium';
-    candidate.needsReview = true;
-    candidate.reviewReason = 'Missing Tender ID';
-  } else {
-    candidate.confidence = 'low';
-    candidate.needsReview = true;
-    candidate.reviewReason = 'Missing title';
-  }
-
-  if (!candidate.tenderId && !candidate.referenceNumber) {
-    candidate.tenderId = 'PENDING-IMPORT';
-    candidate.needsReview = true;
-    candidate.reviewReason = (candidate.reviewReason || '') + ' No ID found';
-  }
-
+  
   return candidate;
 }
 
 /**
- * Extract tender data from a generic text block.
- * This is the most flexible extraction method.
+ * Extract title, reference number, and tender ID from the combined title column.
+ * The real portal format is: [Title](link) [RefNo][TenderID]
  */
-function extractFromBlock(block: string): CandidateTender | null {
-  const lines = block.split('\n').map(l => l.trim()).filter(l => l);
-  if (lines.length === 0) return null;
+function extractTitleColumn(cell: Element, candidate: ParsedCandidate): void {
+  const fullText = cell.textContent?.trim() || '';
   
-  const fullText = block;
+  // Find the detail link
+  const link = cell.querySelector('a[id^="DirectLink"]') || cell.querySelector('a[href*="DirectLink"]');
   
-  const candidate: CandidateTender = {
-    id: uuidv4(),
-    tenderId: '',
-    referenceNumber: '',
-    workName: '',
-    department: '',
-    district: '',
-    tenderAmount: '',
-    emd: '',
-    lastDate: '',
-    publishedDate: '',
-    bidOpeningDate: '',
-    officialUrl: '',
-    organisationChain: '',
-    eligibility: '',
-    tenderFee: '',
-    originalSourceText: block.substring(0, 500),
-    confidence: 'medium',
-    needsReview: false
-  };
-
-  // Extract reference numbers [RefNo][TenderID]
-  const refMatch = fullText.match(/\[([^\]]+)\]\[([^\]]+)\]/);
-  if (refMatch) {
-    candidate.referenceNumber = refMatch[1];
-    candidate.tenderId = refMatch[2];
+  if (link) {
+    // Title is in the link text, possibly wrapped in brackets
+    let title = link.textContent?.trim() || '';
+    if (title.startsWith('[') && title.endsWith(']')) {
+      title = title.slice(1, -1);
+    }
+    candidate.workName = title;
+    
+    // Detail URL
+    const href = link.getAttribute('href') || '';
+    if (href) {
+      candidate.detailUrl = href.startsWith('http') ? href : BASE_URL + (href.startsWith('/') ? '' : '/') + href;
+      candidate.officialUrl = candidate.detailUrl;
+    }
   }
-
-  // Extract standalone tender IDs
-  if (!candidate.tenderId) {
+  
+  // Extract [RefNo][TenderID] pattern from the remaining text
+  const refPattern = /\[([^\]]+)\]\[([^\]]+)\]/;
+  const refMatch = fullText.match(refPattern);
+  
+  if (refMatch) {
+    candidate.referenceNumber = refMatch[1].trim();
+    candidate.tenderId = refMatch[2].trim();
+  } else {
+    // Try to find standalone tender IDs
     const idPatterns = [
-      /\b(\d{4}_\w+_\d+_\d+)\b/,           // 2026_WRD_517082_1
-      /\b(\d{4}[-\/]\w+[-\/]\d+[-\/]?\d*)\b/, // 2026-27/TS-2698/3447
-      /\b(NIT[_\/-][\w\/-]+)\b/i,           // NIT_Bhopal_01/2026
+      /\b(\d{4}_\w+_\d+_\d+)\b/,
+      /\b(\d{4}[-\/]\w+[-\/]\d+(?:[-\/]\d+)?)\b/,
     ];
     for (const pattern of idPatterns) {
       const m = fullText.match(pattern);
@@ -834,153 +630,542 @@ function extractFromBlock(block: string): CandidateTender | null {
       }
     }
   }
+  
+  // If we still don't have a title, use the full text minus the ref pattern
+  if (!candidate.workName) {
+    candidate.workName = fullText.replace(refPattern, '').replace(/\[|\]/g, '').trim();
+  }
+}
 
+// ============ DETAIL PAGE EXTRACTION ============
+
+interface TenderDetailData {
+  workName?: string;
+  tenderId?: string;
+  referenceNumber?: string;
+  department?: string;
+  district?: string;
+  tenderAmount?: string;
+  emd?: string;
+  lastDate?: string;
+  publishedDate?: string;
+  bidOpeningDate?: string;
+  tenderType?: string;
+  contractType?: string;
+  eligibility?: string;
+  tenderFee?: string;
+  documentFee?: string;
+  contactDetails?: string;
+  tenderDocumentLink?: string;
+}
+
+/**
+ * Fetch and parse a tender detail page.
+ * Returns null if the page is inaccessible (stale session, etc.)
+ */
+async function fetchTenderDetail(url: string): Promise<TenderDetailData | null> {
+  // Validate URL belongs to official source
+  if (!url.includes('mptenders.gov.in')) return null;
+  
+  try {
+    let html = '';
+    
+    // Try direct fetch
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(10000), mode: 'cors' });
+      if (resp.ok) html = await resp.text();
+    } catch {}
+    
+    // Try via proxy
+    if (!html) {
+      for (const proxy of CORS_PROXIES) {
+        try {
+          const proxyUrl = `${proxy}${encodeURIComponent(url)}`;
+          const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(12000) });
+          if (resp.ok) {
+            html = await resp.text();
+            break;
+          }
+        } catch { continue; }
+      }
+    }
+    
+    if (!html) return null;
+    
+    // Check for stale session
+    if (html.includes('session has timed out') || html.includes('Stale Session') || html.includes('session=T&')) {
+      return null; // Session expired, can't access detail
+    }
+    
+    return parseTenderDetailPage(html);
+  } catch (e) {
+    console.warn('Detail page fetch error:', e);
+    return null;
+  }
+}
+
+/**
+ * Parse a tender detail page and extract all available fields.
+ */
+function parseTenderDetailPage(html: string): TenderDetailData | null {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    const data: TenderDetailData = {};
+    
+    // Detail pages typically have label-value pairs in tables or divs
+    // Look for common patterns
+    
+    // Method 1: Look for labeled rows (label: value pattern)
+    const allText = doc.body?.textContent || '';
+    
+    // Extract fields using label patterns
+    const fieldPatterns: [RegExp, keyof TenderDetailData][] = [
+      [/(?:Tender|Reference)\s*(?:ID|Number|Identifier)[\s:：]+([^\n<]+)/i, 'tenderId'],
+      [/(?:NIT|Ref)\s*(?:Number|No|Ref)[\s:.：]+([^\n<]+)/i, 'referenceNumber'],
+      [/(?:Title|Work\s*Name|Subject|Description)[\s:：]+([^\n<]+)/i, 'workName'],
+      [/(?:Organisation|Department|Agency)[\s:：]+([^\n<]+)/i, 'department'],
+      [/(?:District|Location|Place)[\s:：]+([^\n<]+)/i, 'district'],
+      [/(?:Tender\s*Value|Estimated\s*(?:Cost|Value)|Contract\s*Value)[\s:：]+([^\n<]+)/i, 'tenderAmount'],
+      [/(?:EMD|Earnest\s*Money)[\s:：]+([^\n<]+)/i, 'emd'],
+      [/(?:Closing\s*Date|Bid\s*Submission\s*(?:End|Closing)\s*Date|Last\s*Date)[\s:：]+([^\n<]+)/i, 'lastDate'],
+      [/(?:Published|Issue|Notification)\s*Date[\s:：]+([^\n<]+)/i, 'publishedDate'],
+      [/(?:Opening\s*Date|Bid\s*Opening)[\s:：]+([^\n<]+)/i, 'bidOpeningDate'],
+      [/(?:Tender\s*Type|Type\s*of\s*Tender)[\s:：]+([^\n<]+)/i, 'tenderType'],
+      [/(?:Form\s*of\s*Contract|Contract\s*Type)[\s:：]+([^\n<]+)/i, 'contractType'],
+      [/(?:Eligibility|Eligibility\s*Criteria)[\s:：]+([^\n<]+)/i, 'eligibility'],
+      [/(?:Tender\s*Fee|Document\s*Fee|Fee)[\s:：]+([^\n<]+)/i, 'tenderFee'],
+      [/(?:Contact|Authority|Officer)[\s:：]+([^\n<]+)/i, 'contactDetails'],
+    ];
+    
+    for (const [pattern, field] of fieldPatterns) {
+      const match = allText.match(pattern);
+      if (match) {
+        const value = match[1].trim();
+        if (value && value.length > 0 && value.length < 500) {
+          (data as any)[field] = value;
+        }
+      }
+    }
+    
+    // Normalize dates
+    if (data.lastDate) data.lastDate = normalizeDate(data.lastDate);
+    if (data.publishedDate) data.publishedDate = normalizeDate(data.publishedDate);
+    if (data.bidOpeningDate) data.bidOpeningDate = normalizeDate(data.bidOpeningDate);
+    
+    // Look for document download links
+    const docLinks = doc.querySelectorAll('a[href*="downloadDocument"], a[href*="TenderDocument"]');
+    if (docLinks.length > 0) {
+      const href = docLinks[0].getAttribute('href');
+      if (href) {
+        data.tenderDocumentLink = href.startsWith('http') ? href : BASE_URL + href;
+      }
+    }
+    
+    // Only return if we found at least some data
+    const hasData = Object.values(data).some(v => v && v.length > 0);
+    return hasData ? data : null;
+  } catch (e) {
+    console.error('Detail page parse error:', e);
+    return null;
+  }
+}
+
+/**
+ * Merge detail page data into an existing tender, without overwriting valid listing data.
+ */
+function mergeDetailData(tender: Tender, detail: TenderDetailData): void {
+  // Only fill in fields that are empty/missing from the listing
+  if (!tender.tenderAmount && detail.tenderAmount) tender.tenderAmount = detail.tenderAmount;
+  if (!tender.emd && detail.emd) tender.emd = detail.emd;
+  if (!tender.eligibility && detail.eligibility) tender.eligibility = detail.eligibility;
+  if (!tender.tenderFee && detail.tenderFee) tender.tenderFee = detail.tenderFee;
+  if (!tender.lastDate && detail.lastDate) tender.lastDate = detail.lastDate;
+  if (!tender.publishedDate && detail.publishedDate) tender.publishedDate = detail.publishedDate;
+  if (!tender.bidOpeningDate && detail.bidOpeningDate) tender.bidOpeningDate = detail.bidOpeningDate;
+  if ((!tender.department || tender.department === 'Not specified in source') && detail.department) tender.department = detail.department;
+  if ((!tender.district || tender.district === 'Not specified in source') && detail.district) tender.district = detail.district;
+  
+  // Add detail-sourced info to notes
+  const detailNotes: string[] = [];
+  if (detail.tenderType) detailNotes.push(`Type: ${detail.tenderType}`);
+  if (detail.contractType) detailNotes.push(`Contract: ${detail.contractType}`);
+  if (detail.contactDetails) detailNotes.push(`Contact: ${detail.contactDetails}`);
+  if (detail.tenderDocumentLink) detailNotes.push(`Document: ${detail.tenderDocumentLink}`);
+  
+  if (detailNotes.length > 0) {
+    tender.notes = (tender.notes || '') + ' | Detail: ' + detailNotes.join('; ');
+  }
+}
+
+// ============ PAGINATION DETECTION ============
+
+/**
+ * Detect pagination links from the listing page.
+ * Returns URLs for subsequent pages.
+ */
+function detectPaginationLinks(html: string): string[] {
+  const links: string[] = [];
+  
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    
+    // Look for pagination links in the footer
+    const pageLinks = doc.querySelectorAll('a[id^="linkPage"], a[id^="linkPage_"]');
+    
+    for (const link of pageLinks) {
+      const href = link.getAttribute('href');
+      if (href) {
+        const fullUrl = href.startsWith('http') ? href : BASE_URL + (href.startsWith('/') ? '' : '/') + href;
+        // Validate it's a pagination link
+        if (fullUrl.includes('TablePages') || fullUrl.includes('linkPage')) {
+          links.push(fullUrl);
+        }
+      }
+    }
+    
+    // Also look for "Next" / forward link
+    const fwdLink = doc.querySelector('a[id="linkFwd"]');
+    if (fwdLink && links.length === 0) {
+      const href = fwdLink.getAttribute('href');
+      if (href) {
+        links.push(href.startsWith('http') ? href : BASE_URL + href);
+      }
+    }
+  } catch (e) {
+    console.warn('Pagination detection error:', e);
+  }
+  
+  return links;
+}
+
+// ============ HEADER NORMALIZATION ============
+
+function normalizeHeaderText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[.]+$/g, '')
+    .trim();
+}
+
+function mapHeaderToField(normalizedHeader: string): string | null {
+  // Direct match
+  if (HEADER_SYNONYMS[normalizedHeader]) {
+    return HEADER_SYNONYMS[normalizedHeader];
+  }
+  
+  // Partial match - check if any synonym is contained in the header
+  for (const [synonym, field] of Object.entries(HEADER_SYNONYMS)) {
+    if (normalizedHeader.includes(synonym) || synonym.includes(normalizedHeader)) {
+      return field;
+    }
+  }
+  
+  return null;
+}
+
+// ============ CONTENT PARSING (for pasted content) ============
+
+/**
+ * Parse pasted HTML/text from the user.
+ * Uses header-aware parsing as primary, with fallbacks.
+ */
+export function parsePastedContent(content: string): { tenders: Tender[]; stats: ImportStats } {
+  const emptyStats: ImportStats = {
+    totalRows: 0, candidatesDetected: 0, parsed: 0, rejected: 0,
+    needsReview: 0, duplicates: 0, missingFields: {}, aiUsed: false,
+    pagesVisited: 1, detailPagesVisited: 0, detailPagesSuccess: 0
+  };
+
+  if (!content || !content.trim()) return { tenders: [], stats: emptyStats };
+
+  // Strategy 1: Header-aware HTML parsing (best for actual portal HTML)
+  const listingResult = parseListingPage(content);
+  if (listingResult.candidates.length >= 3) {
+    const tenders = listingResult.candidates.map(c => candidateToTender(c));
+    return {
+      tenders,
+      stats: {
+        totalRows: listingResult.totalRows,
+        candidatesDetected: listingResult.candidates.length,
+        parsed: tenders.length,
+        rejected: listingResult.rejected,
+        needsReview: tenders.filter(t => t.tenderId === 'PENDING-IMPORT').length,
+        duplicates: 0,
+        missingFields: computeMissingFields(tenders),
+        aiUsed: false,
+        pagesVisited: 1,
+        detailPagesVisited: 0,
+        detailPagesSuccess: 0,
+        headerMap: listingResult.headerMap
+      }
+    };
+  }
+
+  // Strategy 2: DOM-based parsing with DirectLink detection
+  const domResult = parseHTMLWithDirectLinks(content);
+  if (domResult.length >= 1) {
+    const tenders = domResult.map(c => candidateToTender(c));
+    return {
+      tenders,
+      stats: {
+        totalRows: domResult.length,
+        candidatesDetected: domResult.length,
+        parsed: tenders.length,
+        rejected: 0,
+        needsReview: tenders.filter(t => t.tenderId === 'PENDING-IMPORT').length,
+        duplicates: 0,
+        missingFields: computeMissingFields(tenders),
+        aiUsed: false,
+        pagesVisited: 1, detailPagesVisited: 0, detailPagesSuccess: 0
+      }
+    };
+  }
+
+  // Strategy 3: Block-based text parsing
+  const blockResult = parseBlockText(content);
+  if (blockResult.length >= 1) {
+    const tenders = blockResult.map(c => candidateToTender(c));
+    return {
+      tenders,
+      stats: {
+        totalRows: blockResult.length,
+        candidatesDetected: blockResult.length,
+        parsed: tenders.length,
+        rejected: 0,
+        needsReview: tenders.filter(t => t.tenderId === 'PENDING-IMPORT').length,
+        duplicates: 0,
+        missingFields: computeMissingFields(tenders),
+        aiUsed: false,
+        pagesVisited: 1, detailPagesVisited: 0, detailPagesSuccess: 0
+      }
+    };
+  }
+
+  return { tenders: [], stats: emptyStats };
+}
+
+/**
+ * Parse HTML looking specifically for DirectLink anchors (mptenders.gov.in pattern).
+ */
+function parseHTMLWithDirectLinks(html: string): ParsedCandidate[] {
+  const candidates: ParsedCandidate[] = [];
+  
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    
+    // Find all DirectLink anchors
+    const links = doc.querySelectorAll('a[id^="DirectLink"], a[href*="DirectLink"]');
+    
+    for (const link of links) {
+      const candidate: ParsedCandidate = {
+        tenderId: '', referenceNumber: '', workName: '', department: '',
+        district: '', tenderAmount: '', emd: '', lastDate: '',
+        publishedDate: '', bidOpeningDate: '', officialUrl: '', detailUrl: '',
+        organisationChain: '', serialNo: '', extraFields: {}
+      };
+      
+      // Extract title from link
+      let title = link.textContent?.trim() || '';
+      if (title.startsWith('[') && title.endsWith(']')) title = title.slice(1, -1);
+      candidate.workName = title;
+      
+      // Extract URL
+      const href = link.getAttribute('href') || '';
+      if (href) {
+        candidate.detailUrl = href.startsWith('http') ? href : BASE_URL + (href.startsWith('/') ? '' : '/') + href;
+        candidate.officialUrl = candidate.detailUrl;
+      }
+      
+      // Look at parent/sibling elements for dates and org chain
+      const row = link.closest('tr') || link.parentElement?.parentElement;
+      if (row) {
+        const rowText = row.textContent || '';
+        
+        // Extract [RefNo][TenderID]
+        const refMatch = rowText.match(/\[([^\]]+)\]\[([^\]]+)\]/);
+        if (refMatch) {
+          candidate.referenceNumber = refMatch[1];
+          candidate.tenderId = refMatch[2];
+        }
+        
+        // Extract dates
+        const dates = extractAllDates(rowText);
+        candidate.publishedDate = dates.publishedDate;
+        candidate.lastDate = dates.closingDate;
+        candidate.bidOpeningDate = dates.openingDate;
+        
+        // Extract organisation
+        const orgText = extractOrgChainFromText(rowText);
+        if (orgText) {
+          candidate.organisationChain = orgText;
+          candidate.department = extractDepartmentFromOrg(orgText);
+          candidate.district = extractDistrictFromOrg(orgText);
+        }
+      }
+      
+      if (candidate.workName && candidate.workName.length > 5) {
+        candidates.push(candidate);
+      }
+    }
+  } catch (e) {
+    console.error('DirectLink parsing error:', e);
+  }
+  
+  return candidates;
+}
+
+/**
+ * Parse block-based text content.
+ */
+function parseBlockText(text: string): ParsedCandidate[] {
+  const candidates: ParsedCandidate[] = [];
+  const blocks = splitIntoBlocks(text);
+  
+  for (const block of blocks) {
+    const candidate = extractFromBlock(block);
+    if (candidate && candidate.workName && candidate.workName.length > 5) {
+      candidates.push(candidate);
+    }
+  }
+  
+  return candidates;
+}
+
+function splitIntoBlocks(text: string): string[] {
+  // Try multiple splitting strategies
+  const strategies = [
+    text.split(/\n\s*\n/).filter(b => b.trim().length > 20),
+    text.split(/\n\s*(?:\d+[\.\)]\s+)/).filter(b => b.trim().length > 20),
+    text.split(/(?=\[[^\]]{5,}\]\[[^\]]{5,}\])/).filter(b => b.trim().length > 20),
+    text.split(/(?:---+|===+|\*{3,})/).filter(b => b.trim().length > 20),
+  ];
+  
+  let best = strategies[0];
+  for (const s of strategies) {
+    if (s.length > best.length) best = s;
+  }
+  
+  if (best.length <= 1) {
+    // Line-by-line splitting with pattern detection
+    const lines = text.split('\n');
+    const blocks: string[] = [];
+    let current: string[] = [];
+    
+    for (const line of lines) {
+      const isNew = line.match(/^\d+[\.\)]\s+/) || 
+                    line.match(/^Tender\s*ID/i) ||
+                    (line.match(/\b\d{4}_\w+_\d+_\d+\b/) && current.length > 2);
+      
+      if (isNew && current.length > 0) {
+        blocks.push(current.join('\n'));
+        current = [line];
+      } else {
+        current.push(line);
+      }
+    }
+    if (current.length > 0) blocks.push(current.join('\n'));
+    return blocks.filter(b => b.trim().length > 15);
+  }
+  
+  return best;
+}
+
+function extractFromBlock(block: string): ParsedCandidate | null {
+  const lines = block.split('\n').map(l => l.trim()).filter(l => l);
+  const fullText = block;
+  
+  const candidate: ParsedCandidate = {
+    tenderId: '', referenceNumber: '', workName: '', department: '',
+    district: '', tenderAmount: '', emd: '', lastDate: '',
+    publishedDate: '', bidOpeningDate: '', officialUrl: '', detailUrl: '',
+    organisationChain: '', serialNo: '', extraFields: {}
+  };
+  
+  // Extract [RefNo][TenderID]
+  const refMatch = fullText.match(/\[([^\]]+)\]\[([^\]]+)\]/);
+  if (refMatch) {
+    candidate.referenceNumber = refMatch[1];
+    candidate.tenderId = refMatch[2];
+  }
+  
+  // Extract standalone IDs
+  if (!candidate.tenderId) {
+    const idPatterns = [/\b(\d{4}_\w+_\d+_\d+)\b/, /\b(\d{4}[-\/]\w+[-\/]\d+)\b/];
+    for (const p of idPatterns) {
+      const m = fullText.match(p);
+      if (m) { candidate.tenderId = m[1]; break; }
+    }
+  }
+  
   // Extract dates
   const dates = extractAllDates(fullText);
   candidate.publishedDate = dates.publishedDate;
   candidate.lastDate = dates.closingDate;
   candidate.bidOpeningDate = dates.openingDate;
-
+  
   // Extract URL
   const urlMatch = fullText.match(/https?:\/\/[^\s<>"']+/);
-  if (urlMatch) candidate.officialUrl = urlMatch[0];
-
-  // Extract organisation chain
+  if (urlMatch) {
+    candidate.officialUrl = urlMatch[0];
+    candidate.detailUrl = urlMatch[0];
+  }
+  
+  // Extract org chain
   candidate.organisationChain = extractOrgChainFromText(fullText);
-  candidate.department = extractDepartmentFromText(fullText) || candidate.organisationChain;
-  candidate.district = extractDistrictFromText(fullText);
-
-  // Extract tender value
-  candidate.tenderAmount = extractTenderValue(fullText);
-  candidate.emd = extractEMD(fullText);
-  candidate.tenderFee = extractTenderFee(fullText);
-
-  // Extract title - try multiple strategies
-  candidate.workName = extractTitleFromBlock(lines, fullText);
-
-  // Determine confidence and review status
-  if (candidate.workName && candidate.tenderId && candidate.lastDate) {
-    candidate.confidence = 'high';
-  } else if (candidate.workName && (candidate.tenderId || candidate.lastDate)) {
-    candidate.confidence = 'medium';
-    candidate.needsReview = true;
-    candidate.reviewReason = !candidate.tenderId ? 'Missing Tender ID' : 'Missing closing date';
-  } else if (candidate.workName) {
-    candidate.confidence = 'low';
-    candidate.needsReview = true;
-    candidate.reviewReason = 'Missing Tender ID and dates';
-  } else {
-    return null; // No title found, not a valid tender
-  }
-
-  if (!candidate.tenderId && !candidate.referenceNumber) {
-    candidate.tenderId = 'PENDING-IMPORT';
-  }
-
-  return candidate;
-}
-
-/**
- * Extract title from a block of text using multiple strategies.
- */
-function extractTitleFromBlock(lines: string[], fullText: string): string {
-  // Strategy 1: Look for a line that's clearly a title (long, not a date/ref)
+  candidate.department = extractDepartmentFromOrg(candidate.organisationChain) || extractDepartmentFromText(fullText);
+  candidate.district = extractDistrictFromOrg(candidate.organisationChain) || extractDistrictFromText(fullText);
+  
+  // Extract title
   for (const line of lines) {
-    if (line.length > 20 && !isDateOrReferenceLine(line) && !line.match(/^[\[\d]/) && !line.match(/^(Tender|Reference|NIT|Closing|Opening|Publish|Department|Organisation|District|Location|EMD|Value)/i)) {
-      return cleanHTML(line);
+    if (line.length > 20 && !isMetadataLine(line) && !line.match(/^[\[\d]/)) {
+      candidate.workName = cleanText(line);
+      break;
     }
   }
   
-  // Strategy 2: Look for text between markers
-  const titleMatch = fullText.match(/(?:Title|Work|Subject|Description)[\s:：]+(.+?)(?:\n|$)/i);
-  if (titleMatch) return cleanHTML(titleMatch[1]);
-  
-  // Strategy 3: Find the longest line that's not metadata
-  let bestLine = '';
-  for (const line of lines) {
-    if (line.length > bestLine.length && !isDateOrReferenceLine(line) && !line.match(/^[\[\d\s:]/) && line.length > 15) {
-      bestLine = line;
+  if (!candidate.workName) {
+    // Use longest non-metadata line
+    let best = '';
+    for (const line of lines) {
+      if (line.length > best.length && !isMetadataLine(line) && line.length > 15) best = line;
     }
+    candidate.workName = cleanText(best);
   }
   
-  return cleanHTML(bestLine);
+  return candidate.workName ? candidate : null;
 }
 
-/**
- * Check if a line is a date or reference number line (not a title).
- */
-function isDateOrReferenceLine(line: string): boolean {
+function isMetadataLine(line: string): boolean {
   const trimmed = line.trim();
   if (trimmed.length < 5) return true;
-  
-  // Pure date lines
   if (/^\d{2}[-\/]\w{3}[-\/]\d{4}/.test(trimmed)) return true;
-  if (/^\d{4}[-\/]\d{2}[-\/]\d{2}/.test(trimmed)) return true;
-  if (/^\d{2}[-\/]\d{2}[-\/]\d{4}/.test(trimmed)) return true;
-  
-  // Reference number patterns
   if (/^\[.+\]\[.+\]$/.test(trimmed)) return true;
-  if (/^\d+[\.\)]\s*$/.test(trimmed)) return true;
-  
-  // Key-value metadata lines
-  if (/^(Tender\s*ID|Reference|NIT|Closing|Opening|Publish|Department|Organisation|District|Location|EMD|Value|Amount|Fee|Eligib|URL|Link|Source|S\.?No)[\s:：]/i.test(trimmed)) return true;
-  
-  // Short lines that are likely labels
-  if (trimmed.length < 10 && !trimmed.includes(' ')) return true;
-  
+  if (/^(Tender|Reference|NIT|Closing|Opening|Publish|Department|Organisation|District|EMD|Value|Amount|Fee|Eligib|URL|S\.?No)[\s:：]/i.test(trimmed)) return true;
   return false;
 }
 
-/**
- * Convert a CandidateTender to the app's Tender type.
- */
-function candidateToTender(candidate: CandidateTender): Tender {
-  return {
-    id: candidate.id,
-    tenderId: candidate.tenderId || candidate.referenceNumber || 'PENDING-IMPORT',
-    workName: candidate.workName || 'Unknown Tender',
-    department: candidate.department || 'Not specified in source',
-    district: candidate.district || 'Not specified in source',
-    tenderAmount: candidate.tenderAmount || '',
-    emd: candidate.emd || '',
-    lastDate: candidate.lastDate || '',
-    officialUrl: candidate.officialUrl || BASE_URL,
-    dataSource: 'imported',
-    textCopied: false,
-    bannerCopied: false,
-    manuallyPublished: false,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    eligibility: candidate.eligibility || '',
-    tenderFee: candidate.tenderFee || '',
-    publishedDate: candidate.publishedDate || '',
-    bidOpeningDate: candidate.bidOpeningDate || '',
-    organisationChain: candidate.organisationChain || '',
-    notes: `Imported on ${new Date().toLocaleDateString()}. ${candidate.needsReview ? '⚠️ Needs review: ' + (candidate.reviewReason || 'Unknown') : ''}`
-  };
-}
+// ============ CSV PARSING ============
 
-/**
- * Parse CSV content for tender import.
- */
 export function parseCSVContent(csv: string): { tenders: Tender[]; stats: ImportStats } {
   const tenders: Tender[] = [];
   const stats: ImportStats = {
-    totalRows: 0,
-    candidatesDetected: 0,
-    parsed: 0,
-    rejected: 0,
-    needsReview: 0,
-    duplicates: 0,
-    missingFields: {},
-    aiUsed: false
+    totalRows: 0, candidatesDetected: 0, parsed: 0, rejected: 0,
+    needsReview: 0, duplicates: 0, missingFields: {}, aiUsed: false,
+    pagesVisited: 1, detailPagesVisited: 0, detailPagesSuccess: 0
   };
 
   const lines = csv.split('\n').filter(l => l.trim());
-  
   if (lines.length < 2) return { tenders, stats };
   
-  // Skip header row
   for (let i = 1; i < lines.length; i++) {
     stats.totalRows++;
     stats.candidatesDetected++;
@@ -988,23 +1173,12 @@ export function parseCSVContent(csv: string): { tenders: Tender[]; stats: Import
     
     if (cols.length >= 2 && cols[1]) {
       tenders.push({
-        id: uuidv4(),
-        tenderId: cols[0] || 'PENDING-IMPORT',
-        workName: cols[1],
-        department: cols[2] || '',
-        district: cols[3] || '',
-        tenderAmount: cols[4] || '',
-        emd: cols[5] || '',
-        lastDate: cols[6] || '',
-        officialUrl: cols[7] || BASE_URL,
-        dataSource: 'imported',
-        textCopied: false,
-        bannerCopied: false,
-        manuallyPublished: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        eligibility: cols[8] || '',
-        notes: `Imported from CSV on ${new Date().toLocaleDateString()}.`
+        id: uuidv4(), tenderId: cols[0] || 'PENDING-IMPORT', workName: cols[1],
+        department: cols[2] || '', district: cols[3] || '', tenderAmount: cols[4] || '',
+        emd: cols[5] || '', lastDate: cols[6] || '', officialUrl: cols[7] || BASE_URL,
+        dataSource: 'imported', textCopied: false, bannerCopied: false, manuallyPublished: false,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+        eligibility: cols[8] || '', notes: `Imported from CSV on ${new Date().toLocaleDateString()}.`
       });
       stats.parsed++;
     } else {
@@ -1019,145 +1193,139 @@ function parseCSVLine(line: string): string[] {
   const result: string[] = [];
   let current = '';
   let inQuotes = false;
-  
   for (let i = 0; i < line.length; i++) {
     const char = line[i];
-    if (char === '"') {
-      inQuotes = !inQuotes;
-    } else if (char === ',' && !inQuotes) {
-      result.push(current.trim());
-      current = '';
-    } else {
-      current += char;
-    }
+    if (char === '"') inQuotes = !inQuotes;
+    else if (char === ',' && !inQuotes) { result.push(current.trim()); current = ''; }
+    else current += char;
   }
   result.push(current.trim());
   return result;
 }
 
-// ============ HELPER FUNCTIONS ============
+// ============ CONVERSION & HELPERS ============
 
-function cleanHTML(str: string): string {
-  return str
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+function candidateToTender(c: ParsedCandidate): Tender {
+  return {
+    id: uuidv4(),
+    tenderId: c.tenderId || c.referenceNumber || 'PENDING-IMPORT',
+    workName: c.workName || 'Unknown Tender',
+    department: c.department || c.organisationChain || 'Not specified in source',
+    district: c.district || 'Not specified in source',
+    tenderAmount: c.tenderAmount || '',
+    emd: c.emd || '',
+    lastDate: c.lastDate || '',
+    officialUrl: c.officialUrl || c.detailUrl || BASE_URL,
+    dataSource: 'imported',
+    textCopied: false, bannerCopied: false, manuallyPublished: false,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    eligibility: '', tenderFee: '',
+    publishedDate: c.publishedDate || '',
+    bidOpeningDate: c.bidOpeningDate || '',
+    organisationChain: c.organisationChain || '',
+    notes: `Imported on ${new Date().toLocaleDateString()}.`
+  };
+}
+
+function computeMissingFields(tenders: Tender[]): Record<string, number> {
+  const missing: Record<string, number> = {};
+  for (const t of tenders) {
+    if (!t.tenderAmount) missing['tenderAmount'] = (missing['tenderAmount'] || 0) + 1;
+    if (!t.emd) missing['emd'] = (missing['emd'] || 0) + 1;
+    if (!t.lastDate) missing['lastDate'] = (missing['lastDate'] || 0) + 1;
+    if (!t.district || t.district === 'Not specified in source') missing['district'] = (missing['district'] || 0) + 1;
+    if (t.tenderId === 'PENDING-IMPORT') missing['tenderId'] = (missing['tenderId'] || 0) + 1;
+  }
+  return missing;
+}
+
+function cleanText(str: string): string {
+  return str.replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function extractAllDates(text: string): { publishedDate: string; closingDate: string; openingDate: string } {
-  // Try multiple date formats
-  const datePatterns = [
-    /(\d{2}-\w{3}-\d{4}\s+\d{2}:\d{2}\s*[AP]M)/g,  // 22-Oct-2026 11:00 AM
-    /(\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}\s*[AP]M)/g,  // 22/10/2026 11:00 AM
-    /(\d{2}-\w{3}-\d{4})/g,                            // 22-Oct-2026
-    /(\d{4}-\d{2}-\d{2})/g,                            // 2026-10-22
-    /(\d{2}\/\d{2}\/\d{4})/g,                          // 22/10/2026
-    /(\d{2}\.\d{2}\.\d{4})/g,                          // 22.10.2026
+  const patterns = [
+    /(\d{2}-\w{3}-\d{4}\s+\d{2}:\d{2}\s*[AP]M)/g,
+    /(\d{2}-\w{3}-\d{4})/g,
+    /(\d{4}-\d{2}-\d{2})/g,
+    /(\d{2}\/\d{2}\/\d{4})/g,
   ];
   
   const matches: string[] = [];
-  
-  for (const pattern of datePatterns) {
+  for (const pattern of patterns) {
     pattern.lastIndex = 0;
     const found = text.match(pattern);
-    if (found && found.length > 0) {
+    if (found) {
       for (const m of found) {
-        const normalized = normalizeDate(m);
-        if (normalized && !matches.includes(normalized)) {
-          matches.push(normalized);
-        }
+        const n = normalizeDate(m);
+        if (n && !matches.includes(n)) matches.push(n);
       }
       if (matches.length >= 3) break;
     }
   }
   
-  return {
-    publishedDate: matches[0] || '',
-    closingDate: matches[1] || '',
-    openingDate: matches[2] || ''
-  };
-}
-
-function extractDateFromText(text: string): string {
-  const patterns = [
-    /(\d{2}-\w{3}-\d{4}\s+\d{2}:\d{2}\s*[AP]M)/,
-    /(\d{2}-\w{3}-\d{4})/,
-    /(\d{4}-\d{2}-\d{2})/,
-    /(\d{2}\/\d{2}\/\d{4})/,
-  ];
-  
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return normalizeDate(match[0]);
-  }
-  return '';
+  return { publishedDate: matches[0] || '', closingDate: matches[1] || '', openingDate: matches[2] || '' };
 }
 
 function normalizeDate(dateStr: string): string {
   if (!dateStr) return '';
-  
   try {
-    // DD-MMM-YYYY HH:MM AM/PM
     const months: Record<string, string> = {
-      'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04',
-      'May': '05', 'Jun': '06', 'Jul': '07', 'Aug': '08',
-      'Sep': '09', 'Oct': '10', 'Nov': '11', 'Dec': '12',
+      'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04', 'May': '05', 'Jun': '06',
+      'Jul': '07', 'Aug': '08', 'Sep': '09', 'Oct': '10', 'Nov': '11', 'Dec': '12',
       'January': '01', 'February': '02', 'March': '03', 'April': '04',
-      'June': '06', 'July': '07', 'August': '08',
-      'September': '09', 'October': '10', 'November': '11', 'December': '12'
+      'June': '06', 'July': '07', 'August': '08', 'September': '09',
+      'October': '10', 'November': '11', 'December': '12'
     };
     
-    // DD-MMM-YYYY
     let match = dateStr.match(/(\d{1,2})[-\s](\w{3,})[-\s](\d{4})/);
     if (match) {
-      const month = months[match[2].substring(0, 3).charAt(0).toUpperCase() + match[2].substring(1, 3).toLowerCase()] || 
-                    months[match[2]] || '01';
-      const day = match[1].padStart(2, '0');
-      return `${match[3]}-${month}-${day}`;
+      const monthKey = match[2].charAt(0).toUpperCase() + match[2].substring(1, 3).toLowerCase();
+      const month = months[monthKey] || months[match[2]] || '01';
+      return `${match[3]}-${month}-${match[1].padStart(2, '0')}`;
     }
     
-    // YYYY-MM-DD
     match = dateStr.match(/(\d{4})-(\d{2})-(\d{2})/);
     if (match) return match[0];
     
-    // DD/MM/YYYY
     match = dateStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
     if (match) return `${match[3]}-${match[2]}-${match[1]}`;
     
-    // DD.MM.YYYY
     match = dateStr.match(/(\d{2})\.(\d{2})\.(\d{4})/);
     if (match) return `${match[3]}-${match[2]}-${match[1]}`;
-    
   } catch {}
   return dateStr;
 }
 
 function extractOrgChainFromText(text: string): string {
   const patterns = [
-    /(?:Organisation|Organization)[^|]*\|([^<\n]+)/i,
     /(Engineer-in-Chief[^|\n]*)/i,
     /(Executive Engineer[^|\n]*)/i,
     /(Madhya Pradesh[^|\n]*(?:Vidyut|PWD|Water|Department)[^|\n]*)/i,
-    /([A-Z][^|\n]*(?:Department|Division|Circle)[^|\n]*)/i,
+    /([A-Z][^|\n]*(?:Department|Division|Circle|Corporation)[^|\n]*)/i,
   ];
-  
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return cleanHTML(match[1] || match[0]).substring(0, 200);
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m) return cleanText(m[1] || m[0]).substring(0, 200);
   }
-  
   return '';
+}
+
+function extractDepartmentFromOrg(orgChain: string): string {
+  if (!orgChain) return '';
+  // Take the first segment before ||
+  const first = orgChain.split('||')[0].trim();
+  return extractDepartmentFromText(first) || cleanText(first).substring(0, 100);
+}
+
+function extractDistrictFromOrg(orgChain: string): string {
+  return extractDistrictFromText(orgChain);
 }
 
 function extractDistrictFromText(text: string): string {
   if (!text) return '';
-  
   const mpDistricts = [
     'Agar Malwa', 'Alirajpur', 'Anuppur', 'Ashoknagar', 'Balaghat', 'Barwani',
     'Betul', 'Bhind', 'Bhopal', 'Burhanpur', 'Chhatarpur', 'Chhindwara',
@@ -1168,101 +1336,27 @@ function extractDistrictFromText(text: string): string {
     'Satna', 'Sehore', 'Seoni', 'Shahdol', 'Shajapur', 'Sheopur', 'Shivpuri',
     'Sidhi', 'Singrauli', 'Tikamgarh', 'Ujjain', 'Umaria', 'Vidisha'
   ];
-  
-  for (const district of mpDistricts) {
-    if (text.toUpperCase().includes(district.toUpperCase())) {
-      return district;
-    }
+  for (const d of mpDistricts) {
+    if (text.toUpperCase().includes(d.toUpperCase())) return d;
   }
-  
   return '';
 }
 
 function extractDepartmentFromText(text: string): string {
   if (!text) return '';
-  
-  const deptKeywords = [
-    'Water Resources Department',
-    'Public Health Engineering',
-    'PWD',
-    'Madhya Pradesh Paschim Kshetra Vidyut Vitran',
-    'Madhya Pradesh Madhya Kshetra Vidyut Vitran',
-    'Madhya Pradesh Poorv Kshetra Vidyut Vitran',
-    'MP Power Transmission',
-    'MP Power Generation',
-    'Urban Administration',
-    'Rural Development',
-    'Education Department',
-    'Health Department',
-    'Forest Department',
-    'Agriculture Department',
-    'Irrigation Department',
-    'Energy Department',
-    'Transport Department',
-    'Directorate of Technical Education',
-    'Government Polytechnic',
+  const keywords = [
+    'Water Resources Department', 'Public Health Engineering', 'PWD',
+    'Madhya Pradesh Paschim Kshetra Vidyut Vitran', 'Madhya Pradesh Madhya Kshetra Vidyut Vitran',
+    'Madhya Pradesh Poorv Kshetra Vidyut Vitran', 'MP Power Transmission', 'MP Power Generation',
+    'Urban Administration', 'Rural Development', 'Education Department', 'Health Department',
+    'Forest Department', 'Agriculture Department', 'Irrigation Department', 'Energy Department',
+    'Transport Department', 'Directorate of Technical Education', 'Government Polytechnic',
   ];
-  
-  for (const keyword of deptKeywords) {
-    if (text.includes(keyword)) {
-      return keyword;
-    }
+  for (const k of keywords) {
+    if (text.includes(k)) return k;
   }
-  
-  // Fallback: look for common patterns
-  const patterns = [
-    /([A-Z][^|\n]*(?:Department|Division|Board|Corporation|Directorate)[^|\n]*)/i,
-  ];
-  
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return cleanHTML(match[1]).substring(0, 100);
-  }
-  
-  return '';
-}
-
-function extractTenderValue(text: string): string {
-  // Look for currency values
-  const patterns = [
-    /(?:Tender\s*Value|Estimated\s*Value|Amount|Value)[\s:：]*[\u20B9Rs.]*\s*([\d,]+(?:\.\d+)?)\s*(?:Crore|Lakh|Crores|Lakhs|Cr|L)?/i,
-    /[\u20B9Rs.]\s*([\d,]+(?:\.\d+)?)\s*(?:Crore|Lakh|Crores|Lakhs|Cr|L)/i,
-    /([\d,]+(?:\.\d+)?)\s*(?:Crore|Lakh|Crores|Lakhs)/i,
-  ];
-  
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[0].trim();
-  }
-  
-  return '';
-}
-
-function extractEMD(text: string): string {
-  const patterns = [
-    /(?:EMD|Earnest\s*Money|Security\s*Deposit)[\s:：]*[\u20B9Rs.]*\s*([\d,]+(?:\.\d+)?)/i,
-    /EMD[\s:：]*([\d,]+)/i,
-  ];
-  
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[0].trim();
-  }
-  
-  return '';
-}
-
-function extractTenderFee(text: string): string {
-  const patterns = [
-    /(?:Tender\s*Fee|Document\s*Fee|Fee)[\s:：]*[\u20B9Rs.]*\s*([\d,]+(?:\.\d+)?)/i,
-    /Fee[\s:：]*[\u20B9Rs.]*\s*([\d,]+)/i,
-  ];
-  
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[0].trim();
-  }
-  
+  const m = text.match(/([A-Z][^|\n]*(?:Department|Division|Board|Corporation|Directorate)[^|\n]*)/i);
+  if (m) return cleanText(m[1]).substring(0, 100);
   return '';
 }
 
@@ -1272,17 +1366,11 @@ export interface AIProviderConfig {
   enabled: boolean;
   provider: 'openai' | 'anthropic' | 'custom';
   apiUrl: string;
-  apiKey: string; // Note: should be set server-side in production
+  apiKey: string;
   model: string;
 }
 
-/**
- * Check if AI extraction is configured.
- * In production, this should check server-side configuration.
- * For the client-side app, we show a message about configuration.
- */
 export function isAIConfigured(): boolean {
-  // Check localStorage for AI config (set via settings)
   try {
     const config = localStorage.getItem('ai_provider_config');
     if (config) {
@@ -1305,290 +1393,108 @@ export function saveAIConfig(config: AIProviderConfig): void {
   localStorage.setItem('ai_provider_config', JSON.stringify(config));
 }
 
-/**
- * AI-assisted tender extraction.
- * Sends text to an AI model and asks it to extract structured tender data.
- * 
- * IMPORTANT: In production, API keys should NEVER be in frontend code.
- * This implementation routes through a configurable API endpoint.
- * If no API is configured, this function returns null and the app falls back to deterministic parsing.
- */
-export async function extractTendersWithAI(
-  content: string,
-  config?: AIProviderConfig
-): Promise<{ tenders: Tender[]; stats: ImportStats } | null> {
+export async function extractTendersWithAI(content: string, config?: AIProviderConfig): Promise<{ tenders: Tender[]; stats: ImportStats } | null> {
   const aiConfig = config || getAIConfig();
-  
-  if (!aiConfig || !aiConfig.enabled || !aiConfig.apiUrl || !aiConfig.apiKey) {
-    return null; // AI not configured
-  }
+  if (!aiConfig?.enabled || !aiConfig.apiUrl || !aiConfig.apiKey) return null;
 
   const stats: ImportStats = {
-    totalRows: 0,
-    candidatesDetected: 0,
-    parsed: 0,
-    rejected: 0,
-    needsReview: 0,
-    duplicates: 0,
-    missingFields: {},
-    aiUsed: true,
-    aiProvider: aiConfig.provider
+    totalRows: 0, candidatesDetected: 0, parsed: 0, rejected: 0,
+    needsReview: 0, duplicates: 0, missingFields: {}, aiUsed: true,
+    aiProvider: aiConfig.provider, pagesVisited: 1, detailPagesVisited: 0, detailPagesSuccess: 0
   };
 
   try {
-    const systemPrompt = `You are a tender data extraction assistant for Indian government tenders (specifically Madhya Pradesh e-Procurement portal). Extract all tender records from the provided text and return them as a JSON array.
-
-For each tender, extract these fields:
-- title: The tender/work title
-- tenderId: The tender identifier (usually a code like 2026_WRD_517082_1)
-- referenceNumber: The reference/NIT number
-- department: The department or organisation name
-- district: The district/location in Madhya Pradesh
-- publishDate: Publication date (YYYY-MM-DD format)
-- closingDate: Bid submission closing date (YYYY-MM-DD format)
-- tenderValue: The tender value/amount if mentioned
-- sourceUrl: URL if available
-- originalSourceText: The original text block for this tender
-
-Rules:
-- Use null for genuinely missing fields. NEVER invent or fabricate data.
-- If a field is not present in the text, set it to null.
-- Return a JSON array of objects.
-- Each object must have at least a title to be valid.
-- Detect ALL tender records in the text, even if formatting is inconsistent.`;
-
-    const userPrompt = `Extract all tender records from the following text:\n\n${content.substring(0, 8000)}`;
+    const systemPrompt = `Extract all tender records from the text. Return a JSON array. Each object needs: title, tenderId, referenceNumber, department, district, publishDate (YYYY-MM-DD), closingDate (YYYY-MM-DD), tenderValue, sourceUrl. Use null for missing fields. NEVER fabricate data.`;
+    const userPrompt = `Extract tenders:\n\n${content.substring(0, 8000)}`;
 
     let response: Response;
-    
     if (aiConfig.provider === 'openai') {
       response = await fetch(aiConfig.apiUrl || 'https://api.openai.com/v1/chat/completions', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${aiConfig.apiKey}`
-        },
-        body: JSON.stringify({
-          model: aiConfig.model || 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-          ],
-          temperature: 0.1,
-          response_format: { type: 'json_object' }
-        }),
-        signal: AbortSignal.timeout(30000)
-      });
-    } else if (aiConfig.provider === 'anthropic') {
-      response = await fetch(aiConfig.apiUrl || 'https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': aiConfig.apiKey,
-          'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify({
-          model: aiConfig.model || 'claude-3-haiku-20240307',
-          max_tokens: 4096,
-          messages: [
-            { role: 'user', content: `${systemPrompt}\n\n${userPrompt}` }
-          ]
-        }),
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${aiConfig.apiKey}` },
+        body: JSON.stringify({ model: aiConfig.model || 'gpt-4o-mini', messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], temperature: 0.1, response_format: { type: 'json_object' } }),
         signal: AbortSignal.timeout(30000)
       });
     } else {
-      // Custom endpoint
       response = await fetch(aiConfig.apiUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${aiConfig.apiKey}`
-        },
-        body: JSON.stringify({
-          content: content.substring(0, 8000),
-          systemPrompt
-        }),
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${aiConfig.apiKey}` },
+        body: JSON.stringify({ content: content.substring(0, 8000), systemPrompt }),
         signal: AbortSignal.timeout(30000)
       });
     }
 
-    if (!response.ok) {
-      console.error('AI extraction failed:', response.status, response.statusText);
-      return null;
-    }
-
+    if (!response.ok) return null;
     const data = await response.json();
     
-    // Parse AI response
     let aiTenders: any[] = [];
-    
-    if (aiConfig.provider === 'anthropic') {
-      const textContent = data.content?.[0]?.text || '';
-      const jsonMatch = textContent.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        aiTenders = JSON.parse(jsonMatch[0]);
-      }
-    } else if (data.choices?.[0]?.message?.content) {
-      const content = data.choices[0].message.content;
-      const jsonMatch = content.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        aiTenders = JSON.parse(jsonMatch[0]);
-      } else {
-        const parsed = JSON.parse(content);
-        aiTenders = parsed.tenders || parsed.records || [];
-      }
-    } else if (data.tenders) {
-      aiTenders = data.tenders;
-    } else if (Array.isArray(data)) {
-      aiTenders = data;
-    }
+    if (data.choices?.[0]?.message?.content) {
+      const jsonMatch = data.choices[0].message.content.match(/\[[\s\S]*\]/);
+      if (jsonMatch) aiTenders = JSON.parse(jsonMatch[0]);
+    } else if (data.tenders) aiTenders = data.tenders;
+    else if (Array.isArray(data)) aiTenders = data;
 
-    // Validate and convert AI results to Tender objects
     const tenders: Tender[] = [];
     stats.candidatesDetected = aiTenders.length;
     
     for (const item of aiTenders) {
-      if (!item || !item.title) {
-        stats.rejected++;
-        continue;
-      }
-      
+      if (!item?.title) { stats.rejected++; continue; }
       stats.totalRows++;
-      
-      const tender: Tender = {
-        id: uuidv4(),
-        tenderId: item.tenderId || item.tender_id || 'PENDING-IMPORT',
-        workName: item.title || item.workName || '',
-        department: item.department || item.organisation || '',
-        district: item.district || item.location || '',
-        tenderAmount: item.tenderValue || item.tender_value || item.amount || '',
-        emd: item.emd || '',
-        lastDate: normalizeDate(item.closingDate || item.closing_date || item.lastDate || ''),
-        officialUrl: item.sourceUrl || item.source_url || item.url || BASE_URL,
-        dataSource: 'imported',
-        textCopied: false,
-        bannerCopied: false,
-        manuallyPublished: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        eligibility: item.eligibility || '',
-        tenderFee: item.tenderFee || item.tender_fee || '',
-        publishedDate: normalizeDate(item.publishDate || item.publish_date || ''),
-        bidOpeningDate: normalizeDate(item.bidOpeningDate || item.opening_date || ''),
-        organisationChain: item.department || '',
-        notes: `AI-extracted on ${new Date().toLocaleDateString()}. Provider: ${aiConfig.provider}.`
-      };
-      
-      // Track missing fields
-      if (!tender.tenderId || tender.tenderId === 'PENDING-IMPORT') {
-        stats.missingFields['tenderId'] = (stats.missingFields['tenderId'] || 0) + 1;
-        stats.needsReview++;
-      }
-      if (!tender.lastDate) stats.missingFields['lastDate'] = (stats.missingFields['lastDate'] || 0) + 1;
-      if (!tender.district) stats.missingFields['district'] = (stats.missingFields['district'] || 0) + 1;
-      
-      tenders.push(tender);
+      tenders.push({
+        id: uuidv4(), tenderId: item.tenderId || 'PENDING-IMPORT', workName: item.title,
+        department: item.department || '', district: item.district || '',
+        tenderAmount: item.tenderValue || '', emd: item.emd || '',
+        lastDate: normalizeDate(item.closingDate || ''), officialUrl: item.sourceUrl || BASE_URL,
+        dataSource: 'imported', textCopied: false, bannerCopied: false, manuallyPublished: false,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+        publishedDate: normalizeDate(item.publishDate || ''), notes: `AI-extracted (${aiConfig.provider}).`
+      });
       stats.parsed++;
     }
 
     return { tenders, stats };
   } catch (e) {
     console.error('AI extraction error:', e);
-    return null; // Fail gracefully, don't crash
+    return null;
   }
 }
 
 /**
- * Combined extraction: deterministic first, AI fallback.
- * Returns the best result with accurate statistics.
+ * Hybrid extraction: deterministic first, AI fallback.
  */
 export async function extractTendersHybrid(content: string): Promise<{
-  tenders: Tender[];
-  stats: ImportStats;
-  method: 'deterministic' | 'ai' | 'hybrid';
-  warning?: string;
+  tenders: Tender[]; stats: ImportStats; method: 'deterministic' | 'ai' | 'hybrid'; warning?: string;
 }> {
-  // Step 1: Deterministic parsing
-  const deterministicResult = parsePastedContent(content);
-  
-  // Step 2: Check if AI should be used as fallback
+  const detResult = parsePastedContent(content);
   const aiAvailable = isAIConfigured();
   
-  if (aiAvailable && deterministicResult.stats.candidatesDetected < 5) {
-    // Try AI extraction
+  if (aiAvailable && detResult.stats.candidatesDetected < 5) {
     const aiResult = await extractTendersWithAI(content);
-    
-    if (aiResult && aiResult.tenders.length > deterministicResult.tenders.length) {
-      // AI found more tenders
-      const warning = deterministicResult.stats.candidatesDetected > 0
-        ? `Deterministic parser found ${deterministicResult.stats.candidatesDetected} candidates, AI found ${aiResult.stats.candidatesDetected}. Using AI results.`
-        : `Deterministic parser found no candidates. AI extraction found ${aiResult.stats.candidatesDetected} tenders.`;
-      
-      return {
-        tenders: aiResult.tenders,
-        stats: aiResult.stats,
-        method: 'ai',
-        warning
-      };
+    if (aiResult && aiResult.tenders.length > detResult.tenders.length) {
+      return { tenders: aiResult.tenders, stats: aiResult.stats, method: 'ai',
+        warning: `AI found ${aiResult.stats.candidatesDetected} tenders vs ${detResult.stats.candidatesDetected} from deterministic parsing.` };
     }
   }
   
-  // Step 3: Generate warning if we suspect missed records
   let warning: string | undefined;
-  const estimatedCount = estimateTenderCount(content);
-  
-  if (estimatedCount > deterministicResult.stats.candidatesDetected + 2) {
-    warning = `⚠️ Input appears to contain ~${estimatedCount} tender records, but only ${deterministicResult.stats.candidatesDetected} were detected. ${aiAvailable ? 'AI fallback was attempted but did not find more.' : 'Configure AI extraction in Settings for better results.'}`;
+  const estimated = estimateTenderCount(content);
+  if (estimated > detResult.stats.candidatesDetected + 2) {
+    warning = `⚠️ Input appears to contain ~${estimated} tender records, but only ${detResult.stats.candidatesDetected} were detected.`;
   }
   
-  return {
-    tenders: deterministicResult.tenders,
-    stats: deterministicResult.stats,
-    method: 'deterministic',
-    warning
-  };
+  return { tenders: detResult.tenders, stats: detResult.stats, method: 'deterministic', warning };
 }
 
-/**
- * Estimate how many tender records are in the text.
- * Uses multiple heuristics to count.
- */
 function estimateTenderCount(text: string): number {
   let count = 0;
-  
-  // Count tender ID patterns
-  const idPatterns = [
-    /\b\d{4}_\w+_\d+_\d+\b/g,
-    /\[\w+\]\[\w+\]/g,
-    /\b\d{4}[-\/]\w+[-\/]\d+\b/g,
-  ];
-  
-  for (const pattern of idPatterns) {
-    const matches = text.match(pattern);
-    if (matches && matches.length > count) {
-      count = matches.length;
-    }
+  const patterns = [/\b\d{4}_\w+_\d+_\d+\b/g, /\[\w+\]\[\w+\]/g, /\b\d{4}[-\/]\w+[-\/]\d+\b/g];
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m && m.length > count) count = m.length;
   }
-  
-  // Count tender links
-  const linkMatches = text.match(/mptenders\.gov\.in[^"'\s]*/g);
-  if (linkMatches && linkMatches.length > count) {
-    count = linkMatches.length;
-  }
-  
-  // Count numbered items
-  const numberedMatches = text.match(/^\s*\d+[\.\)]\s+/gm);
-  if (numberedMatches && numberedMatches.length > count) {
-    count = numberedMatches.length;
-  }
-  
-  // Count date patterns (closing dates)
-  const dateMatches = text.match(/\d{2}-\w{3}-\d{4}\s+\d{2}:\d{2}\s*[AP]M/g);
-  if (dateMatches) {
-    // Typically 3 dates per tender (publish, close, open)
-    const dateCount = Math.floor(dateMatches.length / 3);
-    if (dateCount > count) count = dateCount;
-  }
-  
+  const links = text.match(/mptenders\.gov\.in[^"'\s]*/g);
+  if (links && links.length > count) count = links.length;
+  const numbered = text.match(/^\s*\d+[\.\)]\s+/gm);
+  if (numbered && numbered.length > count) count = numbered.length;
   return count;
 }
