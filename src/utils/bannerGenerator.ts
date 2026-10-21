@@ -3,6 +3,7 @@ import { Tender, AppSettings } from '../types';
 /**
  * Generate a professional PNG banner (1080x1350) for a tender.
  * Uses Canvas API for programmatic generation - no external dependencies.
+ * Only shows verified data from the tender record.
  */
 export async function generateBanner(
   tender: Tender,
@@ -39,111 +40,137 @@ export async function generateBanner(
   ctx.fillStyle = '#ffffff';
   ctx.font = 'bold 28px Inter, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('🏗️ मध्य प्रदेश टेंडर सूचना 🏗️', 540, 120);
+  ctx.fillText('🚨 मध्य प्रदेश टेंडर अपडेट 🚨', 540, 120);
 
   // Gold divider
   ctx.fillStyle = '#d4a017';
   ctx.fillRect(200, 140, 680, 3);
 
+  // Data source indicator
+  let sourceColor = '#ffffff';
+  let sourceLabel = '';
+  if (tender.dataSource === 'sample') {
+    sourceColor = '#ff6b6b';
+    sourceLabel = '⚠️ SAMPLE DATA';
+  } else if (tender.dataSource === 'imported') {
+    sourceColor = '#4ecdc4';
+    sourceLabel = '📥 IMPORTED FROM OFFICIAL PORTAL';
+  } else {
+    sourceColor = '#a8e6cf';
+    sourceLabel = '✅ MANUALLY ENTERED';
+  }
+  ctx.fillStyle = sourceColor;
+  ctx.font = 'bold 16px Inter, sans-serif';
+  ctx.fillText(sourceLabel, 540, 170);
+
   // Tender ID - highlighted
   ctx.fillStyle = '#ffe066';
-  ctx.font = 'bold 36px Inter, sans-serif';
-  ctx.fillText(`टेंडर ID: ${tender.tenderId || 'N/A'}`, 540, 200);
+  ctx.font = 'bold 32px Inter, sans-serif';
+  ctx.fillText(`टेंडर ID: ${tender.tenderId || 'N/A'}`, 540, 220);
+
+  // District and Department
+  ctx.fillStyle = '#bac8ff';
+  ctx.font = '22px Inter, sans-serif';
+  ctx.fillText(`📍 ${tender.district || 'N/A'} | 🏢 ${tender.department || 'N/A'}`, 540, 260);
 
   // Work name
   ctx.fillStyle = '#ffffff';
-  ctx.font = '24px Inter, sans-serif';
+  ctx.font = '22px Inter, sans-serif';
   const workName = tender.workName || 'Not Available';
   const wrappedWorkName = wrapText(ctx, workName, 900);
-  let y = 260;
+  let y = 300;
   for (const line of wrappedWorkName) {
     ctx.fillText(line, 540, y);
-    y += 35;
+    y += 32;
   }
 
-  // Details section
-  y = Math.max(y + 40, 380);
-  
   // Gold line
   ctx.fillStyle = '#d4a017';
-  ctx.fillRect(100, y, 880, 2);
-  y += 40;
+  ctx.fillRect(100, y + 15, 880, 2);
+  y += 50;
 
-  // Detail rows
-  const details = [
-    { label: 'विभाग:', value: tender.department || 'Not Available' },
-    { label: 'जिला:', value: tender.district || 'Not Available' },
-    { label: 'अनुमानित राशि:', value: tender.tenderAmount || 'Not Available' },
-    { label: 'EMD:', value: tender.emd || 'Not Available' },
-    { label: 'अंतिम तिथि:', value: tender.lastDate ? formatDateBanner(tender.lastDate) : 'Not Available' },
-  ];
+  // Details section
+  const details: { label: string; value: string }[] = [];
+  
+  if (tender.tenderAmount) {
+    details.push({ label: '💰 अनुमानित लागत:', value: tender.tenderAmount });
+  }
+  if (tender.emd) {
+    details.push({ label: '🔐 EMD:', value: tender.emd });
+  }
+  if (tender.tenderFee) {
+    details.push({ label: '📄 टेंडर फीस:', value: tender.tenderFee });
+  }
+  if (tender.lastDate) {
+    details.push({ label: '📅 अंतिम तिथि:', value: formatDateBanner(tender.lastDate) });
+  }
 
   ctx.textAlign = 'left';
   for (const detail of details) {
     ctx.fillStyle = '#d4a017';
-    ctx.font = 'bold 24px Inter, sans-serif';
+    ctx.font = 'bold 22px Inter, sans-serif';
     ctx.fillText(detail.label, 120, y);
     
     ctx.fillStyle = '#ffffff';
-    ctx.font = '24px Inter, sans-serif';
-    ctx.fillText(detail.value, 400, y);
-    y += 50;
+    ctx.font = '22px Inter, sans-serif';
+    ctx.fillText(detail.value, 420, y);
+    y += 48;
   }
 
-  // Gold line
-  ctx.fillStyle = '#d4a017';
-  ctx.fillRect(100, y + 10, 880, 2);
-  y += 50;
+  // If no details available, show notice
+  if (details.length === 0) {
+    ctx.fillStyle = '#bac8ff';
+    ctx.font = '20px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('विवरण आधिकारिक स्रोत पर उपलब्ध नहीं', 540, y);
+    y += 40;
+  }
 
-  // Deadline highlight box
-  ctx.fillStyle = 'rgba(212, 160, 23, 0.15)';
-  ctx.fillRect(100, y, 880, 80);
-  ctx.strokeStyle = '#d4a017';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(100, y, 880, 80);
-  
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#ffe066';
-  ctx.font = 'bold 28px Inter, sans-serif';
-  ctx.fillText(`⏰ अंतिम तिथि: ${tender.lastDate ? formatDateBanner(tender.lastDate) : 'N/A'}`, 540, y + 50);
-
-  y += 120;
+  // Deadline highlight box (if deadline exists)
+  if (tender.lastDate) {
+    y += 15;
+    ctx.fillStyle = 'rgba(212, 160, 23, 0.15)';
+    ctx.fillRect(100, y, 880, 75);
+    ctx.strokeStyle = '#d4a017';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(100, y, 880, 75);
+    
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffe066';
+    ctx.font = 'bold 26px Inter, sans-serif';
+    ctx.fillText(`⏰ अंतिम तिथि: ${formatDateBanner(tender.lastDate)}`, 540, y + 47);
+    y += 110;
+  } else {
+    y += 30;
+  }
 
   // Official link note
   ctx.fillStyle = '#bac8ff';
-  ctx.font = '20px Inter, sans-serif';
+  ctx.font = '18px Inter, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('आधिकारिक लिंक: mpeprocurement.gov.in', 540, y);
-
-  y += 50;
+  ctx.fillText('🔗 आधिकारिक लिंक: mptenders.gov.in', 540, y);
+  y += 35;
 
   // Verification notice
   ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
-  ctx.font = '18px Inter, sans-serif';
-  ctx.fillText('⚠️ कृपया आधिकारिक वेबसाइट से सभी जानकारी सत्यापित करें', 540, y);
-
-  // Sample data warning
-  if (tender.dataSource === 'sample') {
-    ctx.fillStyle = '#ff6b6b';
-    ctx.font = 'bold 22px Inter, sans-serif';
-    ctx.fillText('⚠️ SAMPLE DATA - NOT A REAL TENDER ⚠️', 540, y + 50);
-  }
+  ctx.font = '16px Inter, sans-serif';
+  ctx.fillText('⚠️ आवेदन से पहले आधिकारिक NIT और शर्तें जरूर जांचें', 540, y);
 
   // Bottom branding section (only if configured)
-  if (settings.showBranding) {
+  if (settings.showBranding && settings.companyName) {
     // Bottom gold bar
     ctx.fillStyle = '#d4a017';
     ctx.fillRect(60, 1240, 960, 4);
 
     ctx.textAlign = 'center';
     ctx.fillStyle = '#d4a017';
-    ctx.font = 'bold 30px Inter, sans-serif';
-    ctx.fillText(settings.companyName || 'Apex Associates', 540, 1280);
+    ctx.font = 'bold 28px Inter, sans-serif';
+    ctx.fillText(settings.companyName, 540, 1280);
 
     if (settings.companyTagline) {
       ctx.fillStyle = '#ffffff';
-      ctx.font = '18px Inter, sans-serif';
-      ctx.fillText(settings.companyTagline, 540, 1310);
+      ctx.font = '16px Inter, sans-serif';
+      ctx.fillText(settings.companyTagline, 540, 1308);
     }
   }
 
@@ -174,18 +201,22 @@ function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number)
     }
   }
   if (currentLine) lines.push(currentLine);
-  return lines.slice(0, 3); // Max 3 lines
+  return lines.slice(0, 4); // Max 4 lines for work name
 }
 
 function formatDateBanner(dateStr: string): string {
   try {
+    if (dateStr.match(/^\d{4}-\d{2}-\d{2}/)) {
+      const parts = dateStr.split('T')[0].split('-');
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const monthIdx = parseInt(parts[1]) - 1;
+      return `${parts[2]} ${months[monthIdx]} ${parts[0]}`;
+    }
     const date = new Date(dateStr);
-    const months = [
-      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
-    ];
-    return `${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
-  } catch {
-    return dateStr;
-  }
+    if (!isNaN(date.getTime())) {
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      return `${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
+    }
+  } catch {}
+  return dateStr;
 }

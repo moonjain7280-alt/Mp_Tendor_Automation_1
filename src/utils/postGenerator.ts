@@ -1,12 +1,14 @@
-import { Tender } from '../types';
+import { Tender, AppSettings } from '../types';
 
 /**
  * Generate a professional Hindi community post from tender data.
- * Uses deterministic templates - never invents data.
- * Shows "उपलब्ध नहीं" for missing information.
+ * Uses deterministic templates - NEVER invents data.
+ * Shows "आधिकारिक स्रोत पर उपलब्ध नहीं" for missing information.
+ * 
+ * Format follows the exact specification for WhatsApp/Telegram community posts.
  */
-export function generateHindiPost(tender: Tender): string {
-  const notAvailable = 'उपलब्ध नहीं';
+export function generateHindiPost(tender: Tender, settings?: AppSettings): string {
+  const notAvailable = 'आधिकारिक स्रोत पर उपलब्ध नहीं';
   
   const tenderId = tender.tenderId || notAvailable;
   const workName = tender.workName || notAvailable;
@@ -14,67 +16,95 @@ export function generateHindiPost(tender: Tender): string {
   const district = tender.district || notAvailable;
   const tenderAmount = tender.tenderAmount || notAvailable;
   const emd = tender.emd || notAvailable;
+  const tenderFee = tender.tenderFee || notAvailable;
   const lastDate = tender.lastDate ? formatDateHindi(tender.lastDate) : notAvailable;
   const eligibility = tender.eligibility || notAvailable;
-  const officialUrl = tender.officialUrl || 'https://www.mpeprocurement.gov.in';
+  const requiredDocs = tender.requiredDocuments || notAvailable;
+  const officialUrl = tender.officialUrl || 'https://mptenders.gov.in';
+  const contactInfo = settings?.contactInfo || '';
 
-  // Determine data source label
-  let sourceLabel = '';
-  if (tender.dataSource === 'sample') {
-    sourceLabel = '\n\n⚠️ यह SAMPLE DATA है - केवल प्रदर्शन के लिए। वास्तविक टेंडर नहीं।';
-  } else if (tender.dataSource === 'imported') {
-    sourceLabel = '\n\n📥 डेटा स्रोत: Imported';
-  } else {
-    sourceLabel = '\n\n✅ डेटा स्रोत: Manually Entered';
-  }
+  // Build the post - each field is included only if available
+  let post = `🚨 मध्य प्रदेश टेंडर अपडेट
 
-  const post = `🏗️ 🔔 मध्य प्रदेश टेंडर सूचना 🔔 🏗️
+📍 जिला: ${district}
+🏢 विभाग: ${department}
+📌 टेंडर ID: ${tenderId}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-📋 टेंडर संख्या: ${tenderId}
-
-📝 कार्य का विवरण:
+📝 कार्य का नाम:
 ${workName}
 
-🏢 विभाग: ${department}
-📍 जिला: ${district}
+💰 अनुमानित लागत: ${tenderAmount}
+🔐 EMD: ${emd}
+📄 टेंडर फीस: ${tenderFee}
+📅 आवेदन की अंतिम तिथि: ${lastDate}`;
 
-💰 अनुमानित राशि: ${tenderAmount}
-🔒 EMD राशि: ${emd}
+  // Add eligibility only if available
+  if (tender.eligibility && tender.eligibility.trim() !== '') {
+    post += `\n\n👷 पात्रता: ${tender.eligibility}`;
+  } else {
+    post += `\n\n👷 पात्रता: ${notAvailable}`;
+  }
 
-📅 अंतिम तिथि: ${lastDate}
+  // Add required documents only if available
+  if (tender.requiredDocuments && tender.requiredDocuments.trim() !== '') {
+    post += `\n📎 आवश्यक दस्तावेज: ${tender.requiredDocuments}`;
+  } else {
+    post += `\n📎 आवश्यक दस्तावेज: ${notAvailable}`;
+  }
 
-📌 पात्रता:
-${eligibility}
+  post += `
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-🔗 आधिकारिक लिंक:
+🔗 आधिकारिक टेंडर लिंक:
 ${officialUrl}
 
-📲 अधिक जानकारी के लिए संपर्क करें:
-Apex Associates
+⚠️ आवेदन करने से पहले आधिकारिक NIT, शर्तें, corrigendum और अंतिम तिथि जरूर जांचें।`;
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+  // Add company branding
+  if (settings?.companyName) {
+    post += `\n\n${settings.companyName}`;
+    if (settings.companyTagline) {
+      post += `\n${settings.companyTagline}`;
+    }
+  }
+  if (contactInfo) {
+    post += `\n📞 ${contactInfo}`;
+  }
 
-⚡ इस टेंडर की पूरी जानकारी के लिए ऊपर दिए गए लिंक पर जाएं।
-⚠️ कृपया आधिकारिक वेबसाइट से सभी जानकारी स्वयं सत्यापित करें।
-
-${sourceLabel}`;
+  // Add data source notice
+  if (tender.dataSource === 'sample') {
+    post += `\n\n⚠️ सूचना: यह SAMPLE DATA है — वास्तविक टेंडर नहीं। केवल प्रदर्शन के लिए।`;
+  } else if (tender.dataSource === 'imported') {
+    post += `\n\n📥 डेटा स्रोत: आधिकारिक पोर्टल से आयातित (mptenders.gov.in)`;
+  } else {
+    post += `\n\n✅ डेटा स्रोत: मैनुअल रूप से दर्ज किया गया`;
+  }
 
   return post;
 }
 
 function formatDateHindi(dateStr: string): string {
   try {
+    // Handle YYYY-MM-DD format
+    if (dateStr.match(/^\d{4}-\d{2}-\d{2}/)) {
+      const parts = dateStr.split('T')[0].split('-');
+      const day = parts[2];
+      const monthIdx = parseInt(parts[1]) - 1;
+      const year = parts[0];
+      const months = [
+        'जनवरी', 'फरवरी', 'मार्च', 'अप्रैल', 'मई', 'जून',
+        'जुलाई', 'अगस्त', 'सितंबर', 'अक्टूबर', 'नवंबर', 'दिसंबर'
+      ];
+      return `${day} ${months[monthIdx]}, ${year}`;
+    }
+    // Handle DD-Mon-YYYY format
     const date = new Date(dateStr);
-    const months = [
-      'जनवरी', 'फरवरी', 'मार्च', 'अप्रैल', 'मई', 'जून',
-      'जुलाई', 'अगस्त', 'सितंबर', 'अक्टूबर', 'नवंबर', 'दिसंबर'
-    ];
-    return `${date.getDate()} ${months[date.getMonth()]}, ${date.getFullYear()}`;
-  } catch {
-    return dateStr;
-  }
+    if (!isNaN(date.getTime())) {
+      const months = [
+        'जनवरी', 'फरवरी', 'मार्च', 'अप्रैल', 'मई', 'जून',
+        'जुलाई', 'अगस्त', 'सितंबर', 'अक्टूबर', 'नवंबर', 'दिसंबर'
+      ];
+      return `${date.getDate()} ${months[date.getMonth()]}, ${date.getFullYear()}`;
+    }
+  } catch {}
+  return dateStr;
 }

@@ -16,6 +16,11 @@ export interface Tender {
   updatedAt: string;
   notes?: string;
   eligibility?: string;
+  tenderFee?: string;
+  publishedDate?: string;
+  bidOpeningDate?: string;
+  organisationChain?: string;
+  requiredDocuments?: string;
 }
 
 export interface TenderFilters {
@@ -33,6 +38,14 @@ export interface AppSettings {
   companyTagline: string;
   showBranding: boolean;
   contactInfo: string;
+}
+
+export interface ImportState {
+  lastRefreshTime: string | null;
+  lastRefreshSource: string | null;
+  lastRefreshCount: number;
+  lastRefreshSuccess: boolean;
+  lastRefreshMessage: string;
 }
 
 export type SortField = 'tenderId' | 'workName' | 'department' | 'district' | 'tenderAmount' | 'lastDate' | 'createdAt';

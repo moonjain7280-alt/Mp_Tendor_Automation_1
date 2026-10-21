@@ -3,6 +3,7 @@ import { Tender } from '../types';
 // ⚠️ SAMPLE DATA - These are demonstration records only.
 // They do NOT represent actual live tenders from the MP e-Procurement portal.
 // Real tender data must be manually entered or imported from official sources.
+// These records are clearly labeled as "SAMPLE" in the dashboard.
 
 export const SAMPLE_TENDERS: Tender[] = [
   {
@@ -14,7 +15,7 @@ export const SAMPLE_TENDERS: Tender[] = [
     tenderAmount: '₹45,00,000',
     emd: '₹90,000',
     lastDate: '2026-02-15',
-    officialUrl: 'https://www.mpeprocurement.gov.in',
+    officialUrl: 'https://mptenders.gov.in',
     dataSource: 'sample',
     textCopied: false,
     bannerCopied: false,
@@ -22,7 +23,7 @@ export const SAMPLE_TENDERS: Tender[] = [
     createdAt: '2026-01-20T10:00:00Z',
     updatedAt: '2026-01-20T10:00:00Z',
     eligibility: 'Class-I contractor with minimum 3 years experience',
-    notes: 'This is sample data for demonstration purposes only.'
+    notes: '⚠️ This is SAMPLE DATA for demonstration only. Not a real tender.'
   },
   {
     id: 'sample-002',
@@ -33,7 +34,7 @@ export const SAMPLE_TENDERS: Tender[] = [
     tenderAmount: '₹1,25,00,000',
     emd: '₹2,50,000',
     lastDate: '2026-02-20',
-    officialUrl: 'https://www.mpeprocurement.gov.in',
+    officialUrl: 'https://mptenders.gov.in',
     dataSource: 'sample',
     textCopied: false,
     bannerCopied: false,
@@ -41,7 +42,7 @@ export const SAMPLE_TENDERS: Tender[] = [
     createdAt: '2026-01-21T10:00:00Z',
     updatedAt: '2026-01-21T10:00:00Z',
     eligibility: 'Class-I contractor registered with MP PWD',
-    notes: 'This is sample data for demonstration purposes only.'
+    notes: '⚠️ This is SAMPLE DATA for demonstration only. Not a real tender.'
   },
   {
     id: 'sample-003',
@@ -52,7 +53,7 @@ export const SAMPLE_TENDERS: Tender[] = [
     tenderAmount: '₹32,00,000',
     emd: '₹64,000',
     lastDate: '2026-01-30',
-    officialUrl: 'https://www.mpeprocurement.gov.in',
+    officialUrl: 'https://mptenders.gov.in',
     dataSource: 'sample',
     textCopied: false,
     bannerCopied: false,
@@ -60,6 +61,6 @@ export const SAMPLE_TENDERS: Tender[] = [
     createdAt: '2026-01-15T10:00:00Z',
     updatedAt: '2026-01-15T10:00:00Z',
     eligibility: 'Registered contractor with building construction experience',
-    notes: 'This is sample data for demonstration purposes only.'
+    notes: '⚠️ This is SAMPLE DATA for demonstration only. Not a real tender.'
   }
 ];

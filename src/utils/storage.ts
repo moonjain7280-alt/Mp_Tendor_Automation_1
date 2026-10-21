@@ -1,7 +1,8 @@
-import { Tender, AppSettings } from '../types';
+import { Tender, AppSettings, ImportState } from '../types';
 
 const TENDERS_KEY = 'mp_tender_intelligence_tenders';
 const SETTINGS_KEY = 'mp_tender_intelligence_settings';
+const IMPORT_STATE_KEY = 'mp_tender_intelligence_import_state';
 
 const DEFAULT_SETTINGS: AppSettings = {
   companyName: 'Apex Associates',
@@ -47,6 +48,32 @@ export function saveSettings(settings: AppSettings): void {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   } catch (e) {
     console.error('Failed to save settings to localStorage:', e);
+  }
+}
+
+export function loadImportState(): ImportState {
+  try {
+    const data = localStorage.getItem(IMPORT_STATE_KEY);
+    if (data) {
+      return JSON.parse(data);
+    }
+  } catch (e) {
+    console.error('Failed to load import state:', e);
+  }
+  return {
+    lastRefreshTime: null,
+    lastRefreshSource: null,
+    lastRefreshCount: 0,
+    lastRefreshSuccess: false,
+    lastRefreshMessage: ''
+  };
+}
+
+export function saveImportState(state: ImportState): void {
+  try {
+    localStorage.setItem(IMPORT_STATE_KEY, JSON.stringify(state));
+  } catch (e) {
+    console.error('Failed to save import state:', e);
   }
 }
 

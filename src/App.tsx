@@ -1,23 +1,26 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Tender, TenderFilters, AppSettings, SortField, SortDirection } from './types';
+import { Tender, TenderFilters, AppSettings, ImportState, SortField, SortDirection } from './types';
 import { MP_DISTRICTS, DEPARTMENTS } from './data/districts';
 import { SAMPLE_TENDERS } from './data/sampleTenders';
 import { generateHindiPost } from './utils/postGenerator';
 import { generateBanner } from './utils/bannerGenerator';
-import { loadTenders, saveTenders, loadSettings, saveSettings } from './utils/storage';
+import { loadTenders, saveTenders, loadSettings, saveSettings, loadImportState, saveImportState } from './utils/storage';
 import { exportToCSV } from './utils/csvExport';
+import { fetchLiveTenders, parsePastedContent, parseCSVContent } from './utils/tenderImport';
 import { v4 as uuidv4 } from 'uuid';
 import {
   Search, Plus, Download, Trash2, Edit3, Copy, Check, X, Eye,
   Filter, Settings, FileText, Image, ExternalLink, AlertTriangle,
-  ChevronDown, ChevronUp, Undo2, RefreshCw, Database, Info
+  ChevronDown, ChevronUp, Undo2, RefreshCw, Database, Info,
+  Upload, Clipboard, Globe, Clock, Zap, Edit
 } from 'lucide-react';
 
-type View = 'dashboard' | 'addTender' | 'settings';
+type View = 'dashboard' | 'addTender' | 'importData' | 'settings';
 
 export default function App() {
   const [tenders, setTenders] = useState<Tender[]>([]);
   const [settings, setSettings] = useState<AppSettings>(loadSettings());
+  const [importState, setImportState] = useState<ImportState>(loadImportState());
   const [view, setView] = useState<View>('dashboard');
   const [editingTender, setEditingTender] = useState<Tender | null>(null);
   const [selectedTender, setSelectedTender] = useState<Tender | null>(null);
@@ -27,6 +30,7 @@ export default function App() {
   const [notification, setNotification] = useState<{ message: string; type: 'success' | 'error' | 'warning' | 'info' } | null>(null);
   const [sortField, setSortField] = useState<SortField>('createdAt');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [filters, setFilters] = useState<TenderFilters>({
     search: '',
     district: '',
@@ -41,7 +45,7 @@ export default function App() {
   useEffect(() => {
     const loaded = loadTenders();
     if (loaded.length === 0) {
-      // Load sample data on first visit
+      // Load sample data on first visit only
       setTenders(SAMPLE_TENDERS);
       saveTenders(SAMPLE_TENDERS);
     } else {
@@ -51,15 +55,47 @@ export default function App() {
 
   // Save tenders whenever they change
   useEffect(() => {
-    if (tenders.length > 0) {
-      saveTenders(tenders);
-    }
+    saveTenders(tenders);
   }, [tenders]);
 
   const showNotification = useCallback((message: string, type: 'success' | 'error' | 'warning' | 'info' = 'info') => {
     setNotification({ message, type });
-    setTimeout(() => setNotification(null), 4000);
+    setTimeout(() => setNotification(null), 5000);
   }, []);
+
+  // Refresh real tenders from official portal
+  const handleRefreshTenders = async () => {
+    setIsRefreshing(true);
+    try {
+      const result = await fetchLiveTenders();
+      
+      const newState: ImportState = {
+        lastRefreshTime: result.timestamp,
+        lastRefreshSource: result.source,
+        lastRefreshCount: result.tenders.length,
+        lastRefreshSuccess: result.success,
+        lastRefreshMessage: result.message
+      };
+      setImportState(newState);
+      saveImportState(newState);
+
+      if (result.success && result.tenders.length > 0) {
+        // Add imported tenders (avoid duplicates by tenderId)
+        setTenders(prev => {
+          const existingIds = new Set(prev.map(t => t.tenderId));
+          const newTenders = result.tenders.filter(t => !existingIds.has(t.tenderId));
+          return [...newTenders, ...prev];
+        });
+        showNotification(`✅ Successfully imported ${result.tenders.length} real tenders from official portal.`, 'success');
+      } else {
+        showNotification(`⚠️ ${result.message}`, 'warning');
+      }
+    } catch (e) {
+      showNotification('Failed to refresh tenders. Please try the manual import option.', 'error');
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
 
   // Filter and sort tenders
   const filteredTenders = tenders
@@ -84,6 +120,7 @@ export default function App() {
       if (filters.deadlineFilter !== 'all') {
         const now = new Date();
         const deadline = new Date(t.lastDate);
+        if (isNaN(deadline.getTime())) return true; // Include if no date
         if (filters.deadlineFilter === 'expired' && deadline >= now) return false;
         if (filters.deadlineFilter === 'upcoming' && deadline < now) return false;
         if (filters.deadlineFilter === 'thisWeek') {
@@ -109,7 +146,6 @@ export default function App() {
       return sortDirection === 'asc' ? cmp : -cmp;
     });
 
-  // Check for duplicate tender IDs
   const findDuplicates = (tenderId: string, excludeId?: string): boolean => {
     return tenders.some(t => t.tenderId === tenderId && t.id !== excludeId);
   };
@@ -142,25 +178,25 @@ export default function App() {
   };
 
   const handleCopyPost = async (tender: Tender) => {
-    const post = generateHindiPost(tender);
+    const post = generateHindiPost(tender, settings);
     try {
       await navigator.clipboard.writeText(post);
       setTenders(prev => prev.map(t => t.id === tender.id ? { ...t, textCopied: true, updatedAt: new Date().toISOString() } : t));
-      showNotification('Post copied to clipboard!', 'success');
+      showNotification('✅ Post copied to clipboard successfully!', 'success');
     } catch {
-      showNotification('Failed to copy. Please try manually.', 'error');
+      // Fallback: show manual copy option
+      showNotification('Clipboard access denied. Use "Preview & Copy" for manual copy.', 'error');
     }
   };
 
   const handleCopyBanner = async (tender: Tender) => {
     try {
       const blob = await generateBanner(tender, settings);
-      // Try clipboard API
       if (navigator.clipboard && typeof ClipboardItem !== 'undefined') {
         try {
           await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
           setTenders(prev => prev.map(t => t.id === tender.id ? { ...t, bannerCopied: true, updatedAt: new Date().toISOString() } : t));
-          showNotification('Banner copied to clipboard!', 'success');
+          showNotification('✅ Banner copied to clipboard!', 'success');
           return;
         } catch {
           // Fall through to download
@@ -173,7 +209,7 @@ export default function App() {
       link.download = `banner_${tender.tenderId}.png`;
       link.click();
       URL.revokeObjectURL(url);
-      showNotification('Banner downloaded. Click "Mark Copied" after sharing.', 'info');
+      showNotification('📥 Banner downloaded. Click "Mark Copied" after sharing.', 'info');
     } catch {
       showNotification('Failed to generate banner.', 'error');
     }
@@ -181,7 +217,7 @@ export default function App() {
 
   const handleMarkBannerCopied = (id: string) => {
     setTenders(prev => prev.map(t => t.id === id ? { ...t, bannerCopied: true, updatedAt: new Date().toISOString() } : t));
-    showNotification('Banner marked as copied', 'success');
+    showNotification('✅ Banner marked as copied', 'success');
   };
 
   const handleDuplicate = (tender: Tender) => {
@@ -202,17 +238,18 @@ export default function App() {
   // Stats
   const stats = {
     total: tenders.length,
+    real: tenders.filter(t => t.dataSource === 'imported').length,
     sample: tenders.filter(t => t.dataSource === 'sample').length,
+    manual: tenders.filter(t => t.dataSource === 'manual').length,
     textCopied: tenders.filter(t => t.textCopied).length,
     bannerCopied: tenders.filter(t => t.bannerCopied).length,
-    published: tenders.filter(t => t.manuallyPublished).length,
   };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50">
       {/* Notification */}
       {notification && (
-        <div className={`fixed top-4 right-4 z-50 px-6 py-3 rounded-lg shadow-lg text-white font-medium transition-all ${
+        <div className={`fixed top-4 right-4 z-50 px-6 py-3 rounded-lg shadow-lg text-white font-medium transition-all max-w-md ${
           notification.type === 'success' ? 'bg-green-600' :
           notification.type === 'error' ? 'bg-red-600' :
           notification.type === 'warning' ? 'bg-amber-600' : 'bg-navy-700'
@@ -234,22 +271,28 @@ export default function App() {
                 <p className="text-xs text-navy-200">by Apex Associates</p>
               </div>
             </div>
-            <nav className="flex items-center gap-2">
+            <nav className="flex items-center gap-2 flex-wrap">
               <button
                 onClick={() => { setView('dashboard'); setSelectedTender(null); }}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${view === 'dashboard' ? 'bg-navy-700 text-white' : 'text-navy-200 hover:text-white hover:bg-navy-700'}`}
+                className={`px-3 py-2 rounded-lg text-sm font-medium transition ${view === 'dashboard' ? 'bg-navy-700 text-white' : 'text-navy-200 hover:text-white hover:bg-navy-700'}`}
               >
                 <Database className="w-4 h-4 inline mr-1" /> Dashboard
               </button>
               <button
-                onClick={() => { setView('addTender'); setEditingTender(null); }}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${view === 'addTender' ? 'bg-gold-500 text-navy-900' : 'text-navy-200 hover:text-white hover:bg-navy-700'}`}
+                onClick={() => { setView('importData'); }}
+                className={`px-3 py-2 rounded-lg text-sm font-medium transition ${view === 'importData' ? 'bg-gold-500 text-navy-900' : 'text-navy-200 hover:text-white hover:bg-navy-700'}`}
               >
-                <Plus className="w-4 h-4 inline mr-1" /> Add Tender
+                <Upload className="w-4 h-4 inline mr-1" /> Import
+              </button>
+              <button
+                onClick={() => { setView('addTender'); setEditingTender(null); }}
+                className={`px-3 py-2 rounded-lg text-sm font-medium transition ${view === 'addTender' ? 'bg-navy-700 text-white' : 'text-navy-200 hover:text-white hover:bg-navy-700'}`}
+              >
+                <Plus className="w-4 h-4 inline mr-1" /> Add
               </button>
               <button
                 onClick={() => setView('settings')}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${view === 'settings' ? 'bg-navy-700 text-white' : 'text-navy-200 hover:text-white hover:bg-navy-700'}`}
+                className={`px-3 py-2 rounded-lg text-sm font-medium transition ${view === 'settings' ? 'bg-navy-700 text-white' : 'text-navy-200 hover:text-white hover:bg-navy-700'}`}
               >
                 <Settings className="w-4 h-4 inline mr-1" /> Settings
               </button>
@@ -282,6 +325,30 @@ export default function App() {
             onShowBanner={(t) => { setSelectedTender(t); setShowBannerModal(true); }}
             onExportCSV={() => exportToCSV(filteredTenders)}
             onEdit={(t) => { setEditingTender(t); setView('addTender'); }}
+            importState={importState}
+            onRefresh={handleRefreshTenders}
+            isRefreshing={isRefreshing}
+            onGoToImport={() => setView('importData')}
+          />
+        )}
+
+        {view === 'importData' && (
+          <ImportView
+            onImportComplete={(newTenders, message) => {
+              setTenders(prev => [...newTenders, ...prev]);
+              const newState: ImportState = {
+                lastRefreshTime: new Date().toISOString(),
+                lastRefreshSource: 'manual_import',
+                lastRefreshCount: newTenders.length,
+                lastRefreshSuccess: true,
+                lastRefreshMessage: message
+              };
+              setImportState(newState);
+              saveImportState(newState);
+              showNotification(`✅ Imported ${newTenders.length} tenders. ${message}`, 'success');
+              setView('dashboard');
+            }}
+            onGoBack={() => setView('dashboard')}
           />
         )}
 
@@ -316,8 +383,9 @@ export default function App() {
       {showPostModal && selectedTender && (
         <PostModal
           tender={selectedTender}
+          settings={settings}
           onClose={() => setShowPostModal(false)}
-          onCopy={() => { handleCopyPost(selectedTender); setShowPostModal(false); }}
+          onCopy={(tender) => { handleCopyPost(tender); setShowPostModal(false); }}
         />
       )}
 
@@ -334,11 +402,11 @@ export default function App() {
 
       {/* Footer */}
       <footer className="bg-navy-900 text-navy-200 text-center py-4 mt-8">
-        <p className="text-sm">MP Tender Intelligence by Apex Associates | Data stored locally in browser</p>
+        <p className="text-sm">MP Tender Intelligence by Apex Associates</p>
         <p className="text-xs mt-1 text-navy-300">
           ⚠️ Always verify tender information from{' '}
-          <a href="https://www.mpeprocurement.gov.in" target="_blank" rel="noopener noreferrer" className="text-gold-400 underline">
-            mpeprocurement.gov.in
+          <a href="https://mptenders.gov.in" target="_blank" rel="noopener noreferrer" className="text-gold-400 underline">
+            mptenders.gov.in
           </a>
         </p>
       </footer>
@@ -347,14 +415,9 @@ export default function App() {
 }
 
 // ============ DASHBOARD VIEW ============
-function DashboardView({
-  tenders, stats, filters, setFilters, showFilters, setShowFilters,
-  sortField, sortDirection, handleSort, onSelectTender, onDelete,
-  onDuplicate, onUndoCopied, onCopyPost, onCopyBanner, onMarkBannerCopied,
-  onShowPost, onShowBanner, onExportCSV, onEdit
-}: {
+function DashboardView(props: {
   tenders: Tender[];
-  stats: { total: number; sample: number; textCopied: number; bannerCopied: number; published: number };
+  stats: { total: number; real: number; sample: number; manual: number; textCopied: number; bannerCopied: number };
   filters: TenderFilters;
   setFilters: React.Dispatch<React.SetStateAction<TenderFilters>>;
   showFilters: boolean;
@@ -373,23 +436,71 @@ function DashboardView({
   onShowBanner: (t: Tender) => void;
   onExportCSV: () => void;
   onEdit: (t: Tender) => void;
+  importState: ImportState;
+  onRefresh: () => void;
+  isRefreshing: boolean;
+  onGoToImport: () => void;
 }) {
+  const {
+    tenders, stats, filters, setFilters, showFilters, setShowFilters,
+    sortField, sortDirection, handleSort, onDelete, onDuplicate,
+    onUndoCopied, onCopyPost, onCopyBanner, onMarkBannerCopied,
+    onShowPost, onShowBanner, onExportCSV, onEdit, importState,
+    onRefresh, isRefreshing, onGoToImport
+  } = props;
+
   return (
     <div>
+      {/* Refresh Status Bar */}
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 mb-4">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-3">
+            <div className={`w-3 h-3 rounded-full ${importState.lastRefreshSuccess ? 'bg-green-500' : 'bg-amber-500'}`} />
+            <div>
+              <p className="text-sm font-medium text-slate-700">
+                {importState.lastRefreshTime 
+                  ? `Last refresh: ${new Date(importState.lastRefreshTime).toLocaleString()}`
+                  : 'No refresh yet — use Import to add real tenders'}
+              </p>
+              {importState.lastRefreshMessage && (
+                <p className="text-xs text-slate-500 mt-0.5 max-w-lg truncate">{importState.lastRefreshMessage}</p>
+              )}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onRefresh}
+              disabled={isRefreshing}
+              className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 transition disabled:opacity-50 flex items-center gap-2"
+            >
+              <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+              {isRefreshing ? 'Refreshing...' : 'Refresh Real Tenders'}
+            </button>
+            <button
+              onClick={onGoToImport}
+              className="px-4 py-2 bg-navy-700 text-white rounded-lg text-sm font-medium hover:bg-navy-800 transition flex items-center gap-2"
+            >
+              <Upload className="w-4 h-4" /> Import Data
+            </button>
+          </div>
+        </div>
+      </div>
+
       {/* Stats Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
-        <StatCard label="Total Tenders" value={stats.total} icon={<Database className="w-5 h-5" />} color="bg-navy-700" />
-        <StatCard label="Sample Data" value={stats.sample} icon={<AlertTriangle className="w-5 h-5" />} color="bg-amber-500" />
-        <StatCard label="Text Copied" value={stats.textCopied} icon={<FileText className="w-5 h-5" />} color="bg-green-600" />
-        <StatCard label="Banners Copied" value={stats.bannerCopied} icon={<Image className="w-5 h-5" />} color="bg-purple-600" />
-        <StatCard label="Published" value={stats.published} icon={<Check className="w-5 h-5" />} color="bg-blue-600" />
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+        <StatCard label="Total" value={stats.total} icon={<Database className="w-5 h-5" />} color="bg-navy-700" />
+        <StatCard label="Real (Imported)" value={stats.real} icon={<Globe className="w-5 h-5" />} color="bg-green-600" />
+        <StatCard label="Manual" value={stats.manual} icon={<Edit className="w-5 h-5" />} color="bg-blue-600" />
+        <StatCard label="Sample" value={stats.sample} icon={<AlertTriangle className="w-5 h-5" />} color="bg-amber-500" />
+        <StatCard label="Text Copied" value={stats.textCopied} icon={<FileText className="w-5 h-5" />} color="bg-purple-600" />
+        <StatCard label="Banners" value={stats.bannerCopied} icon={<Image className="w-5 h-5" />} color="bg-indigo-600" />
       </div>
 
       {/* Storage Notice */}
       <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-start gap-2">
         <Info className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" />
         <div className="text-sm text-blue-800">
-          <strong>Data Persistence:</strong> Data is stored in your browser's localStorage. It persists across sessions on this device but is not synced to any server. Clear browser data to reset. For production, integrate a backend database.
+          <strong>Data stored locally.</strong> Use "Import Data" to add real tenders from mptenders.gov.in. The portal blocks automated access from browsers — use the HTML paste method for best results.
         </div>
       </div>
 
@@ -416,76 +527,32 @@ function DashboardView({
             onClick={onExportCSV}
             className="px-4 py-2 rounded-lg text-sm font-medium bg-green-600 text-white hover:bg-green-700 transition"
           >
-            <Download className="w-4 h-4 inline mr-1" /> Export CSV
+            <Download className="w-4 h-4 inline mr-1" /> CSV
           </button>
         </div>
 
-        {/* Filter Panel */}
         {showFilters && (
           <div className="mt-4 pt-4 border-t border-slate-100 grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-3">
-            <SelectFilter
-              label="District"
-              value={filters.district}
-              onChange={v => setFilters(f => ({ ...f, district: v }))}
-              options={[{ value: '', label: 'All MP' }, ...MP_DISTRICTS.map(d => ({ value: d, label: d }))]}
-            />
-            <SelectFilter
-              label="Department"
-              value={filters.department}
-              onChange={v => setFilters(f => ({ ...f, department: v }))}
-              options={[{ value: '', label: 'All Departments' }, ...DEPARTMENTS.map(d => ({ value: d, label: d }))]}
-            />
-            <SelectFilter
-              label="Deadline"
-              value={filters.deadlineFilter}
-              onChange={v => setFilters(f => ({ ...f, deadlineFilter: v as TenderFilters['deadlineFilter'] }))}
-              options={[
-                { value: 'all', label: 'All' },
-                { value: 'upcoming', label: 'Upcoming' },
-                { value: 'thisWeek', label: 'This Week' },
-                { value: 'expired', label: 'Expired' }
-              ]}
-            />
-            <SelectFilter
-              label="Text Status"
-              value={filters.copyStatus}
-              onChange={v => setFilters(f => ({ ...f, copyStatus: v as TenderFilters['copyStatus'] }))}
-              options={[
-                { value: 'all', label: 'All' },
-                { value: 'copied', label: 'Copied' },
-                { value: 'notCopied', label: 'Not Copied' }
-              ]}
-            />
-            <SelectFilter
-              label="Banner Status"
-              value={filters.bannerStatus}
-              onChange={v => setFilters(f => ({ ...f, bannerStatus: v as TenderFilters['bannerStatus'] }))}
-              options={[
-                { value: 'all', label: 'All' },
-                { value: 'copied', label: 'Copied' },
-                { value: 'notCopied', label: 'Not Copied' }
-              ]}
-            />
-            <SelectFilter
-              label="Data Source"
-              value={filters.dataSource}
-              onChange={v => setFilters(f => ({ ...f, dataSource: v as TenderFilters['dataSource'] }))}
-              options={[
-                { value: 'all', label: 'All' },
-                { value: 'manual', label: 'Manual' },
-                { value: 'imported', label: 'Imported' },
-                { value: 'sample', label: 'Sample' }
-              ]}
-            />
+            <SelectFilter label="District" value={filters.district} onChange={v => setFilters(f => ({ ...f, district: v }))}
+              options={[{ value: '', label: 'All MP' }, ...MP_DISTRICTS.map(d => ({ value: d, label: d }))]} />
+            <SelectFilter label="Department" value={filters.department} onChange={v => setFilters(f => ({ ...f, department: v }))}
+              options={[{ value: '', label: 'All Departments' }, ...DEPARTMENTS.map(d => ({ value: d, label: d }))]} />
+            <SelectFilter label="Deadline" value={filters.deadlineFilter} onChange={v => setFilters(f => ({ ...f, deadlineFilter: v as TenderFilters['deadlineFilter'] }))}
+              options={[{ value: 'all', label: 'All' }, { value: 'upcoming', label: 'Upcoming' }, { value: 'thisWeek', label: 'This Week' }, { value: 'expired', label: 'Expired' }]} />
+            <SelectFilter label="Text Status" value={filters.copyStatus} onChange={v => setFilters(f => ({ ...f, copyStatus: v as TenderFilters['copyStatus'] }))}
+              options={[{ value: 'all', label: 'All' }, { value: 'copied', label: 'Copied' }, { value: 'notCopied', label: 'Not Copied' }]} />
+            <SelectFilter label="Banner Status" value={filters.bannerStatus} onChange={v => setFilters(f => ({ ...f, bannerStatus: v as TenderFilters['bannerStatus'] }))}
+              options={[{ value: 'all', label: 'All' }, { value: 'copied', label: 'Copied' }, { value: 'notCopied', label: 'Not Copied' }]} />
+            <SelectFilter label="Data Source" value={filters.dataSource} onChange={v => setFilters(f => ({ ...f, dataSource: v as TenderFilters['dataSource'] }))}
+              options={[{ value: 'all', label: 'All' }, { value: 'imported', label: '🟢 Real (Imported)' }, { value: 'manual', label: '🔵 Manual' }, { value: 'sample', label: '🟡 Sample' }]} />
           </div>
         )}
       </div>
 
       {/* Results count */}
       <div className="text-sm text-slate-600 mb-2">
-        Showing {tenders.length} of {stats.total} tenders
-        {filters.district && <span className="ml-2 text-navy-700 font-medium">• District: {filters.district}</span>}
-        {filters.department && <span className="ml-2 text-navy-700 font-medium">• Dept: {filters.department}</span>}
+        Showing {tenders.length} tender{tenders.length !== 1 ? 's' : ''}
+        {filters.district && <span className="ml-2 text-navy-700 font-medium">• {filters.district}</span>}
       </div>
 
       {/* Tender Table */}
@@ -496,22 +563,20 @@ function DashboardView({
               <tr>
                 <SortableHeader field="tenderId" label="Tender ID" current={sortField} dir={sortDirection} onSort={handleSort} />
                 <SortableHeader field="workName" label="Work Name" current={sortField} dir={sortDirection} onSort={handleSort} />
-                <SortableHeader field="department" label="Department" current={sortField} dir={sortDirection} onSort={handleSort} />
-                <SortableHeader field="district" label="District" current={sortField} dir={sortDirection} onSort={handleSort} />
+                <th className="px-3 py-3 text-left text-xs font-medium">Department / District</th>
                 <SortableHeader field="tenderAmount" label="Amount" current={sortField} dir={sortDirection} onSort={handleSort} />
-                <th className="px-3 py-3 text-left">EMD</th>
                 <SortableHeader field="lastDate" label="Last Date" current={sortField} dir={sortDirection} onSort={handleSort} />
-                <th className="px-3 py-3 text-center">Status</th>
-                <th className="px-3 py-3 text-center">Actions</th>
+                <th className="px-3 py-3 text-center text-xs font-medium">Status</th>
+                <th className="px-3 py-3 text-center text-xs font-medium">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {tenders.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="px-6 py-12 text-center text-slate-500">
+                  <td colSpan={7} className="px-6 py-12 text-center text-slate-500">
                     <Database className="w-12 h-12 mx-auto mb-3 text-slate-300" />
                     <p className="font-medium">No tenders found</p>
-                    <p className="text-sm">Add a tender or adjust your filters</p>
+                    <p className="text-sm">Use "Import Data" to add real tenders from the official portal</p>
                   </td>
                 </tr>
               ) : (
@@ -519,7 +584,6 @@ function DashboardView({
                   <TenderRow
                     key={tender.id}
                     tender={tender}
-                    onSelect={() => onSelectTender(tender)}
                     onEdit={() => onEdit(tender)}
                     onDelete={() => onDelete(tender.id)}
                     onDuplicate={() => onDuplicate(tender)}
@@ -542,11 +606,10 @@ function DashboardView({
 
 // ============ TENDER ROW ============
 function TenderRow({
-  tender, onSelect, onEdit, onDelete, onDuplicate, onUndoCopied,
+  tender, onEdit, onDelete, onDuplicate, onUndoCopied,
   onCopyPost, onCopyBanner, onMarkBannerCopied, onShowPost, onShowBanner
 }: {
   tender: Tender;
-  onSelect: () => void;
   onEdit: () => void;
   onDelete: () => void;
   onDuplicate: () => void;
@@ -557,75 +620,98 @@ function TenderRow({
   onShowPost: () => void;
   onShowBanner: () => void;
 }) {
-  const isExpired = new Date(tender.lastDate) < new Date();
+  const isExpired = tender.lastDate ? new Date(tender.lastDate) < new Date() : false;
   const [showActions, setShowActions] = useState(false);
 
+  const sourceBadge = tender.dataSource === 'sample' 
+    ? <span className="px-1.5 py-0.5 bg-amber-100 text-amber-700 text-[10px] font-bold rounded">SAMPLE</span>
+    : tender.dataSource === 'imported'
+    ? <span className="px-1.5 py-0.5 bg-green-100 text-green-700 text-[10px] font-bold rounded">REAL</span>
+    : <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 text-[10px] font-bold rounded">MANUAL</span>;
+
   return (
-    <tr className={`hover:bg-slate-50 transition ${tender.dataSource === 'sample' ? 'bg-amber-50/50' : ''}`}>
+    <tr className={`hover:bg-slate-50 transition ${tender.dataSource === 'sample' ? 'bg-amber-50/30' : ''}`}>
       <td className="px-3 py-3">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5">
           <span className="font-mono font-medium text-navy-700 text-xs">{tender.tenderId}</span>
-          {tender.dataSource === 'sample' && (
-            <span className="px-1.5 py-0.5 bg-amber-100 text-amber-700 text-[10px] font-bold rounded">SAMPLE</span>
-          )}
-          {tender.dataSource === 'imported' && (
-            <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 text-[10px] font-bold rounded">IMPORTED</span>
-          )}
-          {tender.dataSource === 'manual' && (
-            <span className="px-1.5 py-0.5 bg-green-100 text-green-700 text-[10px] font-bold rounded">MANUAL</span>
-          )}
+          {sourceBadge}
         </div>
       </td>
-      <td className="px-3 py-3 max-w-[250px]">
-        <p className="truncate text-slate-800" title={tender.workName}>{tender.workName}</p>
-      </td>
-      <td className="px-3 py-3 text-slate-600 text-xs">{tender.department}</td>
-      <td className="px-3 py-3 text-slate-700 font-medium text-xs">{tender.district}</td>
-      <td className="px-3 py-3 text-slate-800 font-medium text-xs">{tender.tenderAmount}</td>
-      <td className="px-3 py-3 text-slate-600 text-xs">{tender.emd}</td>
-      <td className="px-3 py-3">
-        <span className={`text-xs font-medium ${isExpired ? 'text-red-600' : 'text-green-700'}`}>
-          {tender.lastDate || 'N/A'}
-          {isExpired && ' ⚠️'}
-        </span>
+      <td className="px-3 py-3 max-w-[280px]">
+        <p className="truncate text-slate-800 text-xs" title={tender.workName}>{tender.workName}</p>
       </td>
       <td className="px-3 py-3">
-        <div className="flex items-center justify-center gap-1">
-          <span className={`w-3 h-3 rounded-full ${tender.textCopied ? 'bg-green-500' : 'bg-slate-300'}`} title="Text Copied" />
-          <span className={`w-3 h-3 rounded-full ${tender.bannerCopied ? 'bg-purple-500' : 'bg-slate-300'}`} title="Banner Copied" />
-          <span className={`w-3 h-3 rounded-full ${tender.manuallyPublished ? 'bg-blue-500' : 'bg-slate-300'}`} title="Published" />
+        <p className="text-slate-600 text-xs truncate max-w-[150px]" title={tender.department}>{tender.department}</p>
+        <p className="text-slate-800 text-xs font-medium">{tender.district}</p>
+      </td>
+      <td className="px-3 py-3 text-slate-800 font-medium text-xs whitespace-nowrap">
+        {tender.tenderAmount || <span className="text-slate-400">—</span>}
+      </td>
+      <td className="px-3 py-3 whitespace-nowrap">
+        {tender.lastDate ? (
+          <span className={`text-xs font-medium ${isExpired ? 'text-red-600' : 'text-green-700'}`}>
+            {tender.lastDate}
+            {isExpired && ' ⚠️'}
+          </span>
+        ) : <span className="text-slate-400 text-xs">—</span>}
+      </td>
+      <td className="px-3 py-3">
+        <div className="flex items-center justify-center gap-1.5">
+          {tender.textCopied ? (
+            <span className="flex items-center gap-0.5 px-1.5 py-0.5 bg-green-100 text-green-700 text-[10px] font-bold rounded" title="Text Copied">
+              <Check className="w-3 h-3" /> POST
+            </span>
+          ) : (
+            <span className="w-3 h-3 rounded-full bg-slate-300" title="Post not copied" />
+          )}
+          {tender.bannerCopied ? (
+            <span className="flex items-center gap-0.5 px-1.5 py-0.5 bg-purple-100 text-purple-700 text-[10px] font-bold rounded" title="Banner Copied">
+              <Check className="w-3 h-3" /> IMG
+            </span>
+          ) : (
+            <span className="w-3 h-3 rounded-full bg-slate-300" title="Banner not copied" />
+          )}
         </div>
       </td>
       <td className="px-3 py-3">
         <div className="relative">
           <div className="flex items-center justify-center gap-1">
-            <button onClick={onCopyPost} className="p-1.5 rounded hover:bg-green-50 text-green-600" title="Copy Post">
-              <Copy className="w-3.5 h-3.5" />
+            {/* Prominent COPY POST button */}
+            <button
+              onClick={onCopyPost}
+              className={`px-2 py-1 rounded text-[10px] font-bold transition ${
+                tender.textCopied 
+                  ? 'bg-green-100 text-green-700 border border-green-300' 
+                  : 'bg-green-600 text-white hover:bg-green-700'
+              }`}
+              title="Copy Hindi post to clipboard"
+            >
+              {tender.textCopied ? 'COPIED ✓' : 'COPY POST'}
             </button>
             <button onClick={onCopyBanner} className="p-1.5 rounded hover:bg-purple-50 text-purple-600" title="Copy Banner">
               <Image className="w-3.5 h-3.5" />
             </button>
-            <button onClick={() => setShowActions(!showActions)} className="p-1.5 rounded hover:bg-slate-100 text-slate-600" title="More Actions">
-              <RefreshCw className="w-3.5 h-3.5" />
+            <button onClick={() => setShowActions(!showActions)} className="p-1.5 rounded hover:bg-slate-100 text-slate-600" title="More">
+              <ChevronDown className="w-3.5 h-3.5" />
             </button>
           </div>
           {showActions && (
-            <div className="absolute right-0 top-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg z-20 py-1 min-w-[160px]">
+            <div className="absolute right-0 top-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg z-20 py-1 min-w-[180px]">
               <button onClick={() => { onShowPost(); setShowActions(false); }} className="w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 flex items-center gap-2">
-                <Eye className="w-3 h-3" /> Preview Post
+                <Eye className="w-3 h-3" /> Preview & Edit Post
               </button>
               <button onClick={() => { onShowBanner(); setShowActions(false); }} className="w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 flex items-center gap-2">
                 <Image className="w-3 h-3" /> Preview Banner
               </button>
               <button onClick={() => { onEdit(); setShowActions(false); }} className="w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 flex items-center gap-2">
-                <Edit3 className="w-3 h-3" /> Edit
+                <Edit3 className="w-3 h-3" /> Edit Tender
               </button>
               <button onClick={() => { onDuplicate(); setShowActions(false); }} className="w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 flex items-center gap-2">
                 <RefreshCw className="w-3 h-3" /> Duplicate
               </button>
               {tender.textCopied && (
                 <button onClick={() => { onUndoCopied('text'); setShowActions(false); }} className="w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 flex items-center gap-2 text-amber-600">
-                  <Undo2 className="w-3 h-3" /> Undo Text Copy
+                  <Undo2 className="w-3 h-3" /> Undo Post Copy
                 </button>
               )}
               {tender.bannerCopied && (
@@ -638,9 +724,10 @@ function TenderRow({
                   <Check className="w-3 h-3" /> Mark Banner Copied
                 </button>
               )}
-              <button onClick={() => { onSelect(); setShowActions(false); }} className="w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 flex items-center gap-2 text-blue-600">
+              <a href={tender.officialUrl} target="_blank" rel="noopener noreferrer" 
+                className="w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 flex items-center gap-2 text-blue-600">
                 <ExternalLink className="w-3 h-3" /> Official Link
-              </button>
+              </a>
               <hr className="my-1" />
               <button onClick={() => { onDelete(); setShowActions(false); }} className="w-full px-3 py-1.5 text-left text-xs hover:bg-red-50 flex items-center gap-2 text-red-600">
                 <Trash2 className="w-3 h-3" /> Delete
@@ -653,27 +740,244 @@ function TenderRow({
   );
 }
 
+// ============ IMPORT VIEW ============
+function ImportView({ onImportComplete, onGoBack }: {
+  onImportComplete: (tenders: Tender[], message: string) => void;
+  onGoBack: () => void;
+}) {
+  const [activeTab, setActiveTab] = useState<'auto' | 'paste' | 'csv'>('auto');
+  const [pasteContent, setPasteContent] = useState('');
+  const [csvContent, setCsvContent] = useState('');
+  const [isFetching, setIsFetching] = useState(false);
+  const [fetchResult, setFetchResult] = useState<string>('');
+  const [previewTenders, setPreviewTenders] = useState<Tender[]>([]);
+
+  const handleAutoFetch = async () => {
+    setIsFetching(true);
+    setFetchResult('');
+    try {
+      const result = await fetchLiveTenders();
+      if (result.success) {
+        setPreviewTenders(result.tenders);
+        setFetchResult(`✅ Found ${result.tenders.length} real tenders from the official portal.`);
+      } else {
+        setFetchResult(`⚠️ ${result.message}`);
+      }
+    } catch {
+      setFetchResult('❌ Auto-fetch failed. Please use the "Paste HTML" method.');
+    } finally {
+      setIsFetching(false);
+    }
+  };
+
+  const handleParsePaste = () => {
+    if (!pasteContent.trim()) {
+      setFetchResult('Please paste content from the official portal.');
+      return;
+    }
+    const tenders = parsePastedContent(pasteContent);
+    if (tenders.length > 0) {
+      setPreviewTenders(tenders);
+      setFetchResult(`✅ Parsed ${tenders.length} tenders from pasted content.`);
+    } else {
+      setFetchResult('❌ Could not parse any tenders. Make sure you pasted content from mptenders.gov.in → "Tenders by Closing Date" page.');
+    }
+  };
+
+  const handleParseCSV = () => {
+    if (!csvContent.trim()) {
+      setFetchResult('Please paste CSV content.');
+      return;
+    }
+    const tenders = parseCSVContent(csvContent);
+    if (tenders.length > 0) {
+      setPreviewTenders(tenders);
+      setFetchResult(`✅ Parsed ${tenders.length} tenders from CSV.`);
+    } else {
+      setFetchResult('❌ Could not parse any tenders from CSV.');
+    }
+  };
+
+  const handleConfirmImport = () => {
+    if (previewTenders.length > 0) {
+      onImportComplete(previewTenders, `Imported ${previewTenders.length} tenders from ${activeTab === 'auto' ? 'official portal' : activeTab === 'paste' ? 'pasted HTML' : 'CSV file'}.`);
+    }
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto">
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h2 className="text-xl font-bold text-navy-800">Import Real Tender Data</h2>
+            <p className="text-sm text-slate-500">Add actual tenders from the official MP e-Procurement portal.</p>
+          </div>
+          <button onClick={onGoBack} className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm hover:bg-slate-200">
+            ← Back to Dashboard
+          </button>
+        </div>
+
+        {/* Important Notice */}
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-6">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0" />
+            <div className="text-sm text-amber-800">
+              <strong>Why can't we auto-fetch?</strong> The official portal (mptenders.gov.in) blocks automated browser requests due to CORS restrictions and requires CAPTCHAs for search. The "Paste HTML" method below is the most reliable way to import real data.
+            </div>
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <div className="flex gap-2 mb-6 border-b border-slate-200 pb-3">
+          <button onClick={() => setActiveTab('auto')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${activeTab === 'auto' ? 'bg-navy-700 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>
+            <Zap className="w-4 h-4 inline mr-1" /> Auto-Fetch
+          </button>
+          <button onClick={() => setActiveTab('paste')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${activeTab === 'paste' ? 'bg-navy-700 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>
+            <Clipboard className="w-4 h-4 inline mr-1" /> Paste HTML
+          </button>
+          <button onClick={() => setActiveTab('csv')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${activeTab === 'csv' ? 'bg-navy-700 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>
+            <Upload className="w-4 h-4 inline mr-1" /> CSV Import
+          </button>
+        </div>
+
+        {/* Auto-Fetch Tab */}
+        {activeTab === 'auto' && (
+          <div className="space-y-4">
+            <div className="bg-slate-50 rounded-lg p-4">
+              <p className="text-sm text-slate-700 mb-3">
+                This attempts to fetch the latest tenders from mptenders.gov.in through a CORS proxy. Success depends on portal availability and proxy status.
+              </p>
+              <button
+                onClick={handleAutoFetch}
+                disabled={isFetching}
+                className="px-6 py-2.5 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition disabled:opacity-50 flex items-center gap-2"
+              >
+                <RefreshCw className={`w-4 h-4 ${isFetching ? 'animate-spin' : ''}`} />
+                {isFetching ? 'Fetching...' : 'Attempt Auto-Fetch'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Paste HTML Tab */}
+        {activeTab === 'paste' && (
+          <div className="space-y-4">
+            <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+              <h3 className="font-medium text-green-800 text-sm mb-2">📋 How to import from the official portal:</h3>
+              <ol className="text-xs text-green-700 space-y-1 list-decimal list-inside">
+                <li>Open <a href="https://mptenders.gov.in/nicgep/app?page=FrontEndListTendersbyDate&service=page" target="_blank" rel="noopener noreferrer" className="underline font-medium">mptenders.gov.in → Tenders by Closing Date</a></li>
+                <li>Select "Closing Today", "Closing within 7 days", or "Closing within 14 days"</li>
+                <li>Right-click on the tender table → "Inspect" → Copy the outer HTML of the table</li>
+                <li>OR: Select all text on the page (Ctrl+A) and copy (Ctrl+C)</li>
+                <li>Paste the content below and click "Parse"</li>
+              </ol>
+            </div>
+            <textarea
+              value={pasteContent}
+              onChange={e => setPasteContent(e.target.value)}
+              placeholder="Paste HTML or text content from mptenders.gov.in here..."
+              className="w-full h-48 px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-navy-500"
+            />
+            <button
+              onClick={handleParsePaste}
+              className="px-6 py-2.5 bg-navy-700 text-white rounded-lg font-medium hover:bg-navy-800 transition"
+            >
+              Parse Content
+            </button>
+          </div>
+        )}
+
+        {/* CSV Tab */}
+        {activeTab === 'csv' && (
+          <div className="space-y-4">
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <h3 className="font-medium text-blue-800 text-sm mb-2">CSV Format:</h3>
+              <p className="text-xs text-blue-700 font-mono">
+                Tender ID, Work Name, Department, District, Amount, EMD, Last Date (YYYY-MM-DD), URL, Eligibility
+              </p>
+            </div>
+            <textarea
+              value={csvContent}
+              onChange={e => setCsvContent(e.target.value)}
+              placeholder={`Tender ID,Work Name,Department,District,Amount,EMD,Last Date,URL,Eligibility\nNIT_Bhopal_01/2026,Construction of road,PWD,Bhopal,5000000,100000,2026-11-30,https://mptenders.gov.in,...`}
+              className="w-full h-48 px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-navy-500"
+            />
+            <button
+              onClick={handleParseCSV}
+              className="px-6 py-2.5 bg-navy-700 text-white rounded-lg font-medium hover:bg-navy-800 transition"
+            >
+              Parse CSV
+            </button>
+          </div>
+        )}
+
+        {/* Result / Preview */}
+        {fetchResult && (
+          <div className={`mt-6 p-4 rounded-lg border ${
+            fetchResult.startsWith('✅') ? 'bg-green-50 border-green-200' :
+            fetchResult.startsWith('⚠️') ? 'bg-amber-50 border-amber-200' :
+            'bg-red-50 border-red-200'
+          }`}>
+            <p className="text-sm">{fetchResult}</p>
+          </div>
+        )}
+
+        {/* Preview Table */}
+        {previewTenders.length > 0 && (
+          <div className="mt-6">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-bold text-navy-800">Preview: {previewTenders.length} tenders to import</h3>
+              <button
+                onClick={handleConfirmImport}
+                className="px-6 py-2.5 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 transition flex items-center gap-2"
+              >
+                <Check className="w-4 h-4" /> Confirm Import ({previewTenders.length} tenders)
+              </button>
+            </div>
+            <div className="overflow-x-auto border border-slate-200 rounded-lg">
+              <table className="w-full text-xs">
+                <thead className="bg-slate-100">
+                  <tr>
+                    <th className="px-3 py-2 text-left">Tender ID</th>
+                    <th className="px-3 py-2 text-left">Work Name</th>
+                    <th className="px-3 py-2 text-left">District</th>
+                    <th className="px-3 py-2 text-left">Last Date</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {previewTenders.slice(0, 20).map((t, i) => (
+                    <tr key={i} className="hover:bg-slate-50">
+                      <td className="px-3 py-2 font-mono text-navy-700">{t.tenderId}</td>
+                      <td className="px-3 py-2 max-w-[300px] truncate">{t.workName}</td>
+                      <td className="px-3 py-2">{t.district}</td>
+                      <td className="px-3 py-2">{t.lastDate}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {previewTenders.length > 20 && (
+                <p className="text-xs text-slate-500 px-3 py-2">...and {previewTenders.length - 20} more</p>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ============ TENDER FORM ============
-function TenderFormView({
-  tender, findDuplicates, onSave, onCancel
-}: {
+function TenderFormView({ tender, findDuplicates, onSave, onCancel }: {
   tender: Tender | null;
   findDuplicates: (id: string, excludeId?: string) => boolean;
   onSave: (t: Tender) => void;
   onCancel: () => void;
 }) {
   const [form, setForm] = useState<Partial<Tender>>(tender || {
-    tenderId: '',
-    workName: '',
-    department: '',
-    district: '',
-    tenderAmount: '',
-    emd: '',
-    lastDate: '',
-    officialUrl: 'https://www.mpeprocurement.gov.in',
-    dataSource: 'manual',
-    eligibility: '',
-    notes: ''
+    tenderId: '', workName: '', department: '', district: '',
+    tenderAmount: '', emd: '', lastDate: '',
+    officialUrl: 'https://mptenders.gov.in',
+    dataSource: 'manual', eligibility: '', tenderFee: '', requiredDocuments: '', notes: ''
   });
   const [duplicateWarning, setDuplicateWarning] = useState(false);
 
@@ -695,7 +999,7 @@ function TenderFormView({
       tenderAmount: form.tenderAmount || '',
       emd: form.emd || '',
       lastDate: form.lastDate || '',
-      officialUrl: form.officialUrl || 'https://www.mpeprocurement.gov.in',
+      officialUrl: form.officialUrl || 'https://mptenders.gov.in',
       dataSource: form.dataSource as Tender['dataSource'] || 'manual',
       textCopied: tender?.textCopied || false,
       bannerCopied: tender?.bannerCopied || false,
@@ -703,6 +1007,8 @@ function TenderFormView({
       createdAt: tender?.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       eligibility: form.eligibility || '',
+      tenderFee: form.tenderFee || '',
+      requiredDocuments: form.requiredDocuments || '',
       notes: form.notes || ''
     });
   };
@@ -710,12 +1016,8 @@ function TenderFormView({
   return (
     <div className="max-w-3xl mx-auto">
       <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-        <h2 className="text-xl font-bold text-navy-800 mb-1">
-          {tender ? 'Edit Tender' : 'Add New Tender'}
-        </h2>
-        <p className="text-sm text-slate-500 mb-6">
-          Enter tender information manually. Verify all details from the official portal before publishing.
-        </p>
+        <h2 className="text-xl font-bold text-navy-800 mb-1">{tender ? 'Edit Tender' : 'Add New Tender'}</h2>
+        <p className="text-sm text-slate-500 mb-6">Enter verified tender information from the official portal.</p>
 
         {duplicateWarning && (
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 flex items-center gap-2">
@@ -728,131 +1030,84 @@ function TenderFormView({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Tender ID *</label>
-              <input
-                type="text"
-                required
-                value={form.tenderId || ''}
-                onChange={e => {
-                  setForm(f => ({ ...f, tenderId: e.target.value }));
-                  setDuplicateWarning(findDuplicates(e.target.value, tender?.id));
-                }}
-                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-                placeholder="e.g., MP/PWD/2026/001"
-              />
+              <input type="text" required value={form.tenderId || ''}
+                onChange={e => { setForm(f => ({ ...f, tenderId: e.target.value })); setDuplicateWarning(findDuplicates(e.target.value, tender?.id)); }}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" />
             </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Data Source</label>
-              <select
-                value={form.dataSource || 'manual'}
-                onChange={e => setForm(f => ({ ...f, dataSource: e.target.value as Tender['dataSource'] }))}
-                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-              >
-                <option value="manual">Manually Entered</option>
-                <option value="imported">Imported</option>
+              <select value={form.dataSource || 'manual'} onChange={e => setForm(f => ({ ...f, dataSource: e.target.value as Tender['dataSource'] }))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500">
+                <option value="manual">Manually Entered (Verified)</option>
+                <option value="imported">Imported from Portal</option>
               </select>
             </div>
           </div>
 
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-1">Work Name *</label>
-            <input
-              type="text"
-              required
-              value={form.workName || ''}
-              onChange={e => setForm(f => ({ ...f, workName: e.target.value }))}
-              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-              placeholder="Full work description"
-            />
+            <input type="text" required value={form.workName || ''} onChange={e => setForm(f => ({ ...f, workName: e.target.value }))}
+              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" />
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Department</label>
-              <select
-                value={form.department || ''}
-                onChange={e => setForm(f => ({ ...f, department: e.target.value }))}
-                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-              >
+              <select value={form.department || ''} onChange={e => setForm(f => ({ ...f, department: e.target.value }))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500">
                 <option value="">Select Department</option>
                 {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
               </select>
             </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">District</label>
-              <select
-                value={form.district || ''}
-                onChange={e => setForm(f => ({ ...f, district: e.target.value }))}
-                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-              >
+              <select value={form.district || ''} onChange={e => setForm(f => ({ ...f, district: e.target.value }))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500">
                 <option value="">Select District</option>
                 {MP_DISTRICTS.map(d => <option key={d} value={d}>{d}</option>)}
               </select>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Tender Amount</label>
-              <input
-                type="text"
-                value={form.tenderAmount || ''}
-                onChange={e => setForm(f => ({ ...f, tenderAmount: e.target.value }))}
-                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-                placeholder="₹1,00,00,000"
-              />
+              <input type="text" value={form.tenderAmount || ''} onChange={e => setForm(f => ({ ...f, tenderAmount: e.target.value }))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" placeholder="₹1,00,00,000" />
             </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">EMD</label>
-              <input
-                type="text"
-                value={form.emd || ''}
-                onChange={e => setForm(f => ({ ...f, emd: e.target.value }))}
-                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-                placeholder="₹2,00,000"
-              />
+              <input type="text" value={form.emd || ''} onChange={e => setForm(f => ({ ...f, emd: e.target.value }))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" placeholder="₹2,00,000" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Tender Fee</label>
+              <input type="text" value={form.tenderFee || ''} onChange={e => setForm(f => ({ ...f, tenderFee: e.target.value }))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" placeholder="₹500" />
             </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Last Date</label>
-              <input
-                type="date"
-                value={form.lastDate || ''}
-                onChange={e => setForm(f => ({ ...f, lastDate: e.target.value }))}
-                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-              />
+              <input type="date" value={form.lastDate || ''} onChange={e => setForm(f => ({ ...f, lastDate: e.target.value }))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" />
             </div>
           </div>
 
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-1">Official URL</label>
-            <input
-              type="url"
-              value={form.officialUrl || ''}
-              onChange={e => setForm(f => ({ ...f, officialUrl: e.target.value }))}
-              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-              placeholder="https://www.mpeprocurement.gov.in/..."
-            />
+            <input type="url" value={form.officialUrl || ''} onChange={e => setForm(f => ({ ...f, officialUrl: e.target.value }))}
+              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" />
           </div>
 
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-1">Eligibility Criteria</label>
-            <textarea
-              value={form.eligibility || ''}
-              onChange={e => setForm(f => ({ ...f, eligibility: e.target.value }))}
-              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-              rows={2}
-              placeholder="Contractor class, experience requirements, etc."
-            />
+            <textarea value={form.eligibility || ''} onChange={e => setForm(f => ({ ...f, eligibility: e.target.value }))}
+              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" rows={2} />
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Notes</label>
-            <textarea
-              value={form.notes || ''}
-              onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
-              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-              rows={2}
-              placeholder="Internal notes (not included in generated posts)"
-            />
+            <label className="block text-sm font-medium text-slate-700 mb-1">Required Documents</label>
+            <textarea value={form.requiredDocuments || ''} onChange={e => setForm(f => ({ ...f, requiredDocuments: e.target.value }))}
+              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" rows={2} />
           </div>
 
           <div className="flex gap-3 pt-4">
@@ -877,66 +1132,29 @@ function SettingsView({ settings, onSave }: { settings: AppSettings; onSave: (s:
     <div className="max-w-2xl mx-auto">
       <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
         <h2 className="text-xl font-bold text-navy-800 mb-1">Settings</h2>
-        <p className="text-sm text-slate-500 mb-6">Configure branding and display options for generated banners.</p>
-
+        <p className="text-sm text-slate-500 mb-6">Configure branding and display options.</p>
         <div className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-1">Company Name</label>
-            <input
-              type="text"
-              value={form.companyName}
-              onChange={e => setForm(f => ({ ...f, companyName: e.target.value }))}
-              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-            />
+            <input type="text" value={form.companyName} onChange={e => setForm(f => ({ ...f, companyName: e.target.value }))}
+              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" />
           </div>
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-1">Tagline</label>
-            <input
-              type="text"
-              value={form.companyTagline}
-              onChange={e => setForm(f => ({ ...f, companyTagline: e.target.value }))}
-              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-            />
+            <input type="text" value={form.companyTagline} onChange={e => setForm(f => ({ ...f, companyTagline: e.target.value }))}
+              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Contact Info</label>
-            <input
-              type="text"
-              value={form.contactInfo}
-              onChange={e => setForm(f => ({ ...f, contactInfo: e.target.value }))}
-              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500"
-              placeholder="Phone, email, or website"
-            />
+            <label className="block text-sm font-medium text-slate-700 mb-1">Contact Info (shown in posts)</label>
+            <input type="text" value={form.contactInfo} onChange={e => setForm(f => ({ ...f, contactInfo: e.target.value }))}
+              className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-navy-500" placeholder="Phone, email, or website" />
           </div>
           <div className="flex items-center gap-3">
-            <input
-              type="checkbox"
-              id="showBranding"
-              checked={form.showBranding}
-              onChange={e => setForm(f => ({ ...f, showBranding: e.target.checked }))}
-              className="w-4 h-4 rounded border-slate-300 text-navy-700 focus:ring-navy-500"
-            />
+            <input type="checkbox" id="showBranding" checked={form.showBranding} onChange={e => setForm(f => ({ ...f, showBranding: e.target.checked }))}
+              className="w-4 h-4 rounded border-slate-300 text-navy-700 focus:ring-navy-500" />
             <label htmlFor="showBranding" className="text-sm text-slate-700">Show branding on generated banners</label>
           </div>
-
-          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mt-4">
-            <h3 className="font-medium text-blue-800 text-sm mb-2">About Data Storage</h3>
-            <p className="text-xs text-blue-700">
-              This application stores all data in your browser's localStorage. This means data persists across sessions on this device, but is not synced to any cloud server. For a production deployment with multi-device sync, integrate with a backend service like Supabase or Firebase.
-            </p>
-          </div>
-
-          <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
-            <h3 className="font-medium text-amber-800 text-sm mb-2">About Automatic Tender Collection</h3>
-            <p className="text-xs text-amber-700">
-              This MVP does NOT automatically collect tenders from mpeprocurement.gov.in. All tender data must be manually entered or imported. Automatic web scraping requires a backend server and must comply with the portal's terms of service.
-            </p>
-          </div>
-
-          <button
-            onClick={() => onSave(form)}
-            className="px-6 py-2.5 bg-navy-700 text-white rounded-lg font-medium hover:bg-navy-800 transition"
-          >
+          <button onClick={() => onSave(form)} className="px-6 py-2.5 bg-navy-700 text-white rounded-lg font-medium hover:bg-navy-800 transition">
             Save Settings
           </button>
         </div>
@@ -945,22 +1163,50 @@ function SettingsView({ settings, onSave }: { settings: AppSettings; onSave: (s:
   );
 }
 
-// ============ POST MODAL ============
-function PostModal({ tender, onClose, onCopy }: { tender: Tender; onClose: () => void; onCopy: () => void }) {
-  const post = generateHindiPost(tender);
+// ============ POST MODAL (with editable post) ============
+function PostModal({ tender, settings, onClose, onCopy }: {
+  tender: Tender; settings: AppSettings; onClose: () => void; onCopy: (t: Tender) => void;
+}) {
+  const [editablePost, setEditablePost] = useState(generateHindiPost(tender, settings));
+  const [copiedLocally, setCopiedLocally] = useState(false);
+
+  const handleCopyEdited = async () => {
+    try {
+      await navigator.clipboard.writeText(editablePost);
+      setCopiedLocally(true);
+      onCopy(tender);
+    } catch {
+      // Fallback: select text for manual copy
+      const textarea = document.getElementById('post-text') as HTMLTextAreaElement;
+      if (textarea) {
+        textarea.select();
+        document.execCommand('copy');
+        setCopiedLocally(true);
+      }
+    }
+  };
+
   return (
     <div className="fixed inset-0 bg-black/50 z-40 flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[80vh] overflow-hidden" onClick={e => e.stopPropagation()}>
+      <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[85vh] overflow-hidden" onClick={e => e.stopPropagation()}>
         <div className="p-4 border-b border-slate-200 flex items-center justify-between">
-          <h3 className="font-bold text-navy-800">Generated Hindi Post</h3>
+          <h3 className="font-bold text-navy-800">Preview & Edit Post</h3>
           <button onClick={onClose} className="p-1 hover:bg-slate-100 rounded"><X className="w-5 h-5" /></button>
         </div>
-        <div className="p-4 overflow-y-auto max-h-[50vh] font-hindi">
-          <pre className="whitespace-pre-wrap text-sm text-slate-800 leading-relaxed">{post}</pre>
+        <div className="p-4 overflow-y-auto max-h-[55vh]">
+          <textarea
+            id="post-text"
+            value={editablePost}
+            onChange={e => setEditablePost(e.target.value)}
+            className="w-full h-full min-h-[300px] px-3 py-2 border border-slate-200 rounded-lg text-sm font-hindi leading-relaxed focus:outline-none focus:ring-2 focus:ring-navy-500 resize-none"
+          />
         </div>
         <div className="p-4 border-t border-slate-200 flex gap-3">
-          <button onClick={onCopy} className="flex-1 px-4 py-2.5 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition flex items-center justify-center gap-2">
-            <Copy className="w-4 h-4" /> Copy Post
+          <button onClick={handleCopyEdited}
+            className={`flex-1 px-4 py-2.5 rounded-lg font-medium transition flex items-center justify-center gap-2 ${
+              copiedLocally ? 'bg-green-100 text-green-700 border border-green-300' : 'bg-green-600 text-white hover:bg-green-700'
+            }`}>
+            {copiedLocally ? <><Check className="w-4 h-4" /> COPIED ✓</> : <><Copy className="w-4 h-4" /> Copy Post</>}
           </button>
           <button onClick={onClose} className="px-4 py-2.5 bg-slate-100 text-slate-700 rounded-lg font-medium hover:bg-slate-200 transition">
             Close
@@ -1024,10 +1270,10 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
         </div>
         <div className="p-4 border-t border-slate-200 flex flex-wrap gap-2">
           <button onClick={onCopyBanner} className="flex-1 px-3 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 transition flex items-center justify-center gap-1">
-            <Copy className="w-3.5 h-3.5" /> Copy to Clipboard
+            <Copy className="w-3.5 h-3.5" /> Copy
           </button>
           <button onClick={handleDownload} className="flex-1 px-3 py-2 bg-navy-700 text-white rounded-lg text-sm font-medium hover:bg-navy-800 transition flex items-center justify-center gap-1">
-            <Download className="w-3.5 h-3.5" /> Download PNG
+            <Download className="w-3.5 h-3.5" /> Download
           </button>
           <button onClick={onMarkCopied} className="flex-1 px-3 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 transition flex items-center justify-center gap-1">
             <Check className="w-3.5 h-3.5" /> Mark Copied
@@ -1041,14 +1287,14 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
 // ============ HELPER COMPONENTS ============
 function StatCard({ label, value, icon, color }: { label: string; value: number; icon: React.ReactNode; color: string }) {
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
-      <div className="flex items-center gap-3">
-        <div className={`w-10 h-10 ${color} rounded-lg flex items-center justify-center text-white`}>
+    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+      <div className="flex items-center gap-2">
+        <div className={`w-8 h-8 ${color} rounded-lg flex items-center justify-center text-white flex-shrink-0`}>
           {icon}
         </div>
         <div>
-          <p className="text-2xl font-bold text-slate-800">{value}</p>
-          <p className="text-xs text-slate-500">{label}</p>
+          <p className="text-xl font-bold text-slate-800">{value}</p>
+          <p className="text-[10px] text-slate-500 leading-tight">{label}</p>
         </div>
       </div>
     </div>
@@ -1061,11 +1307,8 @@ function SelectFilter({ label, value, onChange, options }: {
   return (
     <div>
       <label className="block text-xs font-medium text-slate-600 mb-1">{label}</label>
-      <select
-        value={value}
-        onChange={e => onChange(e.target.value)}
-        className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-navy-500"
-      >
+      <select value={value} onChange={e => onChange(e.target.value)}
+        className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-navy-500">
         {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
       </select>
     </div>
@@ -1077,10 +1320,7 @@ function SortableHeader({ field, label, current, dir, onSort }: {
 }) {
   const isActive = current === field;
   return (
-    <th
-      className="px-3 py-3 text-left cursor-pointer hover:bg-navy-700 transition select-none"
-      onClick={() => onSort(field)}
-    >
+    <th className="px-3 py-3 text-left cursor-pointer hover:bg-navy-700 transition select-none" onClick={() => onSort(field)}>
       <div className="flex items-center gap-1">
         <span className="text-xs font-medium">{label}</span>
         {isActive && (dir === 'asc' ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />)}
