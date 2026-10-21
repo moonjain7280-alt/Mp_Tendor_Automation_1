@@ -1283,9 +1283,13 @@ function PostModal({ tender, settings, onClose, onCopy }: {
 function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: {
   tender: Tender; settings: AppSettings; onClose: () => void; onCopyBanner: () => void; onMarkCopied: () => void;
 }) {
-  // FIX: Use <img> tag directly with blob URL instead of broken double-canvas approach.
-  // The previous implementation tried to draw onto a canvas that wasn't yet in the DOM,
-  // causing the UI to hang on "Generating banner..." indefinitely.
+  // ROOT CAUSE FIX: The previous implementation had a deadlock:
+  // - isLoading=true showed spinner, hiding the <img> element
+  // - <img> onLoad set isLoading=false, but <img> was never rendered
+  // - Result: spinner forever
+  // 
+  // FIX: Set isLoading=false immediately after blob is created.
+  // The <img> loads asynchronously for display verification only.
   const [bannerUrl, setBannerUrl] = useState<string | null>(null);
   const [bannerError, setBannerError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
@@ -1295,6 +1299,7 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
   useEffect(() => {
     let objectUrl: string | null = null;
     let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout>;
 
     const generate = async () => {
       setIsLoading(true);
@@ -1302,21 +1307,42 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
       setBannerUrl(null);
       setDimensions(null);
 
+      // Timeout: if generation takes more than 10 seconds, show error
+      timeoutId = setTimeout(() => {
+        if (!cancelled) {
+          setBannerError('Banner generation timed out. The operation took too long. Please try again.');
+          setIsLoading(false);
+          cancelled = true;
+        }
+      }, 10000);
+
       try {
         const blob = await generateBanner(tender, settings);
         if (cancelled) return;
 
+        clearTimeout(timeoutId);
+
         // Verify the blob is a valid PNG
         if (!blob || blob.size === 0) {
-          setBannerError('Banner generation returned an empty file.');
+          setBannerError('Banner generation returned an empty file. The canvas may not be rendering correctly.');
           setIsLoading(false);
           return;
         }
 
+        // Verify blob type
+        if (blob.type && blob.type !== 'image/png') {
+          console.warn(`Unexpected blob type: ${blob.type}, expected image/png`);
+        }
+
         objectUrl = URL.createObjectURL(blob);
         setBannerUrl(objectUrl);
+        
+        // CRITICAL FIX: Set isLoading=false HERE, not in img.onload
+        // The blob is ready and valid. The <img> will render and load asynchronously.
+        setIsLoading(false);
       } catch (e: any) {
         if (cancelled) return;
+        clearTimeout(timeoutId);
         console.error('Banner generation failed:', e);
         setBannerError(`Failed to generate banner: ${e?.message || 'Unknown error'}`);
         setIsLoading(false);
@@ -1327,11 +1353,12 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
 
     return () => {
       cancelled = true;
+      clearTimeout(timeoutId);
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [tender, settings]);
 
-  // Verify dimensions once the image loads
+  // Verify dimensions once the image loads (optional, for display info only)
   const handleImageLoad = () => {
     if (imgRef.current) {
       const w = imgRef.current.naturalWidth;
@@ -1341,12 +1368,12 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
         setBannerError(`Warning: Banner dimensions are ${w}×${h}, expected 1080×1350.`);
       }
     }
-    setIsLoading(false);
+    // NOTE: Do NOT set isLoading here anymore - it's already false
   };
 
   const handleImageError = () => {
-    setBannerError('Failed to render the generated banner image.');
-    setIsLoading(false);
+    setBannerError('Failed to render the generated banner image in the browser.');
+    // NOTE: Do NOT set isLoading here anymore - it's already false
   };
 
   const handleDownload = () => {
