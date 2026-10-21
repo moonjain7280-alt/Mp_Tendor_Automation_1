@@ -222,6 +222,24 @@ export default function App() {
   const handleCopyBanner = async (tender: Tender) => {
     try {
       const blob = await generateBanner(tender, settings);
+      
+      // DIAGNOSTIC: Verify blob before proceeding
+      console.log('[Banner Download] Blob generated:', {
+        size: blob.size,
+        type: blob.type,
+        valid: blob.size > 0 && blob.type === 'image/png'
+      });
+      
+      if (!blob || blob.size === 0) {
+        showNotification('❌ Banner generation failed: Empty blob', 'error');
+        return;
+      }
+      
+      if (blob.type && blob.type !== 'image/png') {
+        console.warn('[Banner Download] Unexpected blob type:', blob.type);
+      }
+      
+      // Try clipboard first
       if (navigator.clipboard && typeof ClipboardItem !== 'undefined') {
         try {
           await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
@@ -229,19 +247,44 @@ export default function App() {
           showNotification('✅ Banner copied to clipboard!', 'success');
           return;
         } catch {
+          console.log('[Banner Download] Clipboard API failed, falling back to download');
           // Fall through to download
         }
       }
-      // Fallback: download
+      
+      // Fallback: download with proper URL lifecycle
       const url = URL.createObjectURL(blob);
+      console.log('[Banner Download] Created object URL:', url);
+      
       const link = document.createElement('a');
       link.href = url;
-      link.download = `banner_${tender.tenderId}.png`;
+      // Sanitize filename
+      const safeId = (tender.tenderId || 'tender').replace(/[^a-zA-Z0-9_-]/g, '_');
+      link.download = `banner_${safeId}.png`;
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      
+      // Trigger download
       link.click();
-      URL.revokeObjectURL(url);
-      showNotification('📥 Banner downloaded. Click "Mark Copied" after sharing.', 'info');
-    } catch {
-      showNotification('Failed to generate banner.', 'error');
+      
+      // CRITICAL FIX: Don't revoke immediately! Browser needs time to consume the URL.
+      // Revoke after 60 seconds to ensure download completes.
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        console.log('[Banner Download] Revoked object URL after delay');
+      }, 60000);
+      
+      // Clean up link element after a short delay
+      setTimeout(() => {
+        if (document.body.contains(link)) {
+          document.body.removeChild(link);
+        }
+      }, 1000);
+      
+      showNotification(`📥 Downloading banner (${(blob.size / 1024).toFixed(1)} KB). Check your downloads folder.`, 'success');
+    } catch (e: any) {
+      console.error('[Banner Download] Error:', e);
+      showNotification(`❌ Failed to generate banner: ${e?.message || 'Unknown error'}`, 'error');
     }
   };
 
@@ -1381,18 +1424,54 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
       setBannerError('No banner available to download. Please regenerate.');
       return;
     }
+    
+    console.log('[Banner Modal Download] Initiating download for URL:', bannerUrl);
+    
     try {
-      const link = document.createElement('a');
-      link.href = bannerUrl;
       // Sanitize tender ID for filename
       const safeId = (tender.tenderId || 'tender').replace(/[^a-zA-Z0-9_-]/g, '_');
-      link.download = `banner_${safeId}.png`;
+      const filename = `banner_${safeId}.png`;
+      
+      const link = document.createElement('a');
+      link.href = bannerUrl;
+      link.download = filename;
+      link.style.display = 'none';
+      link.setAttribute('data-testid', 'banner-download-link');
       document.body.appendChild(link);
+      
+      // Trigger download
       link.click();
-      document.body.removeChild(link);
+      
+      console.log('[Banner Modal Download] Download triggered for:', filename);
+      
+      // Clean up link element after delay (don't remove immediately)
+      setTimeout(() => {
+        if (document.body.contains(link)) {
+          document.body.removeChild(link);
+        }
+      }, 1000);
+      
+      // Show success feedback
+      setBannerError(''); // Clear any previous errors
+      // Note: We can't show a notification from here, but the download should work
     } catch (e: any) {
-      console.error('Download failed:', e);
-      setBannerError(`Download failed: ${e?.message || 'Unknown error'}`);
+      console.error('[Banner Modal Download] Error:', e);
+      setBannerError(`Download failed: ${e?.message || 'Unknown error'}. Try right-click → "Save image as..."`);
+    }
+  };
+  
+  // Fallback: Open banner in new tab for manual save
+  const handleOpenInNewTab = () => {
+    if (!bannerUrl) {
+      setBannerError('No banner available.');
+      return;
+    }
+    try {
+      window.open(bannerUrl, '_blank');
+      console.log('[Banner Modal] Opened in new tab');
+    } catch (e: any) {
+      console.error('[Banner Modal] Failed to open in new tab:', e);
+      setBannerError(`Failed to open: ${e?.message || 'Unknown error'}`);
     }
   };
 
@@ -1450,6 +1529,14 @@ function BannerModal({ tender, settings, onClose, onCopyBanner, onMarkCopied }: 
             className="flex-1 px-3 py-2 bg-navy-700 text-white rounded-lg text-sm font-medium hover:bg-navy-800 transition flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Download className="w-3.5 h-3.5" /> Download PNG
+          </button>
+          <button
+            onClick={handleOpenInNewTab}
+            disabled={!bannerUrl}
+            className="flex-1 px-3 py-2 bg-slate-600 text-white rounded-lg text-sm font-medium hover:bg-slate-700 transition flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Open banner in new tab for manual save"
+          >
+            <ExternalLink className="w-3.5 h-3.5" /> Open
           </button>
           <button
             onClick={onMarkCopied}
