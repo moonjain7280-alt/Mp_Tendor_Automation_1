@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@theme {
+  --color-navy-50: #f0f4ff;
+  --color-navy-100: #dbe4ff;
+  --color-navy-200: #bac8ff;
+  --color-navy-300: #91a7ff;
+  --color-navy-400: #748ffc;
+  --color-navy-500: #5c7cfa;
+  --color-navy-600: #4c6ef5;
+  --color-navy-700: #1a237e;
+  --color-navy-800: #0d1642;
+  --color-navy-900: #070d2a;
+  --color-gold-50: #fffef5;
+  --color-gold-100: #fff9db;
+  --color-gold-200: #fff3bf;
+  --color-gold-300: #ffec99;
+  --color-gold-400: #ffe066;
+  --color-gold-500: #d4a017;
+  --color-gold-600: #b8860b;
+  --color-gold-700: #8b6914;
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-hindi: 'Noto Sans Devanagari', sans-serif;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: linear-gradient(135deg, #f8fafc 0%, #e8edf5 100%);
+  min-height: 100vh;
+}
+
+.font-hindi {
+  font-family: var(--font-hindi);
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 3px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 3px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
